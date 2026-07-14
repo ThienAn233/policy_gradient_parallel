@@ -116,12 +116,6 @@ warmup = 1
 deer_iters = 50
 
 # Each pair is (state dimension n, control dimension m).
-#
-# NOTE:
-# The one-pass method uses z = [x; lambda], so deer_alg forms a
-# (2n) x (2n) Jacobian. This can become very memory-heavy for large n.
-# Start with the safe configs, then uncomment larger sizes if your machine
-# has enough memory.
 configs = [
     (3, 1),
     (16, 8),
@@ -289,80 +283,6 @@ def run_one_benchmark(n, m, seed=0):
     deer_two_pass = jax.jit(deer_two_pass_raw)
 
     # ------------------------------------------------------------
-    # Option 1: Decoupled one-pass augmented DEER
-    # ------------------------------------------------------------
-
-    def make_one_pass_driver(states_driver):
-        """
-        Build fixed reversed state driver for the one-pass augmented method.
-
-        states_driver is [x_1, ..., x_T].
-        x_traj       is [x_0, ..., x_{T-1}].
-        x_rev_driver is [x_{T-1}, ..., x_0].
-        """
-        x_traj = jnp.vstack([x0, states_driver[:-1]])
-        x_rev_driver = jnp.flip(x_traj, axis=0)
-        return x_rev_driver
-
-    def f_augmented(z_k, x_rev_driver_k):
-        """
-        Decoupled one-pass augmented dynamics.
-
-        z_k = [x_k, mu_k], where mu_k = lambda_{T-k}.
-
-        State:
-            x_{k+1} = F(x_k)
-
-        Reversed costate:
-            mu_{k+1} = lambda_{T-k-1}
-                     = G(x_{T-k-1}, mu_k)
-
-        The driver x_{T-k-1} is fixed during this DEER solve.
-        This omits the coupled Newton term G_x Delta x.
-        """
-        x_k = z_k[:n]
-        mu_k = z_k[n:]
-
-        x_next = f(x_k, None)
-        mu_next = backward_costate_step(mu_k, x_rev_driver_k)
-
-        return jnp.concatenate([x_next, mu_next])
-
-    z0 = jnp.concatenate([x0, lambda_T])
-    z_guess = jnp.concatenate([states_guess, costate_guess], axis=1)
-
-    def deer_one_pass_raw(states_driver_for_costate):
-        """
-        One DEER call on z = [x, reversed lambda].
-
-        The costate part uses states_driver_for_costate as fixed driver.
-        For a clean comparison, pass the manual rollout.
-        """
-        x_rev_driver = make_one_pass_driver(states_driver_for_costate)
-
-        _, z_deer, newton_steps, *_ = deer_alg_fixed_j(
-            f_augmented,
-            jnp.block([
-                [F_cl, jnp.zeros((n, n))],
-                [jnp.zeros((n, n)), F_x_T],
-            ]),
-            z0,
-            z_guess,
-            x_rev_driver,
-            num_iters=deer_iters,
-            full_trace=False,
-            Ts=None,
-            tol=tol,
-        )
-
-        states_one_pass = z_deer[:, :n]
-        costates_one_pass_rev = z_deer[:, n:]
-
-        return states_one_pass, costates_one_pass_rev, newton_steps
-
-    deer_one_pass = jax.jit(deer_one_pass_raw)
-
-    # ------------------------------------------------------------
     # Timing
     # ------------------------------------------------------------
 
@@ -380,26 +300,12 @@ def run_one_benchmark(n, m, seed=0):
     )
     states_two, lambda_two_rev, fwd_steps, bwd_steps = two_out
 
-    # Option 1 uses the baseline state rollout as fixed costate driver.
-    one_out, t_one, sd_one = time_jax(
-        lambda: deer_one_pass(states_rollout),
-        warmup=warmup,
-        repeat=repeat,
-    )
-    states_one, lambda_one_rev, one_steps = one_out
-
     # ------------------------------------------------------------
     # Accuracy checks against manual sequential baseline
     # ------------------------------------------------------------
 
     two_state_error = float(jnp.max(jnp.abs(states_two - states_rollout)))
     two_costate_error = float(jnp.max(jnp.abs(lambda_two_rev - lambda_seq_rev)))
-
-    one_state_error = float(jnp.max(jnp.abs(states_one - states_rollout)))
-    one_costate_error = float(jnp.max(jnp.abs(lambda_one_rev - lambda_seq_rev)))
-
-    one_vs_two_state_error = float(jnp.max(jnp.abs(states_one - states_two)))
-    one_vs_two_costate_error = float(jnp.max(jnp.abs(lambda_one_rev - lambda_two_rev)))
 
     # ------------------------------------------------------------
     # Gradient norm from sequential baseline
@@ -443,26 +349,12 @@ def run_one_benchmark(n, m, seed=0):
         "t_two": t_two,
         "sd_two": sd_two,
 
-        "t_one": t_one,
-        "sd_one": sd_one,
-
         "two_speedup": t_seq / t_two,
-        "one_speedup": t_seq / t_one,
-        "one_vs_two_speedup": t_two / t_one,
-
         "two_state_error": two_state_error,
         "two_costate_error": two_costate_error,
 
-        "one_state_error": one_state_error,
-        "one_costate_error": one_costate_error,
-
-        "one_vs_two_state_error": one_vs_two_state_error,
-        "one_vs_two_costate_error": one_vs_two_costate_error,
-
         "fwd_newton_steps": int(fwd_steps),
         "bwd_newton_steps": int(bwd_steps),
-        "one_newton_steps": int(one_steps),
-
         "grad_norm": grad_norm,
     }
 
@@ -473,11 +365,10 @@ def run_one_benchmark(n, m, seed=0):
 
 results = []
 
-print("\n================ Shape Scaling Benchmark ================\n")
+print("\n================ Two-Pass DEER Shape Scaling Benchmark ================\n")
 print("Methods:")
 print("  1. Sequential baseline")
 print("  2. Decoupled two-pass DEER")
-print("  3. Decoupled one-pass DEER with fixed costate driver")
 print()
 
 for idx, (n, m) in enumerate(configs):
@@ -499,25 +390,13 @@ for idx, (n, m) in enumerate(configs):
     )
 
     print(
-        f"  One-pass:   {fmt_time(result['t_one'], result['sd_one'])} ms, "
-        f"speedup={result['one_speedup']:.3f}x, "
-        f"vs two-pass={result['one_vs_two_speedup']:.3f}x"
-    )
-
-    print(
         f"  Errors two-pass: state={result['two_state_error']:.3e}, "
         f"costate={result['two_costate_error']:.3e}"
     )
 
     print(
-        f"  Errors one-pass: state={result['one_state_error']:.3e}, "
-        f"costate={result['one_costate_error']:.3e}"
-    )
-
-    print(
         f"  Newton steps: two-pass=({result['fwd_newton_steps']}, "
-        f"{result['bwd_newton_steps']}), "
-        f"one-pass={result['one_newton_steps']}"
+        f"{result['bwd_newton_steps']})"
     )
 
     print()
@@ -532,8 +411,7 @@ print("\n================ Timing Summary Table ================\n")
 header = (
     f"{'n':>5} {'m':>5} {'T':>6} | "
     f"{'Seq mean±std (ms)':>22} | "
-    f"{'Two mean±std (ms)':>22} {'Two Spd':>9} | "
-    f"{'One mean±std (ms)':>22} {'One Spd':>9} {'One/Two':>9}"
+    f"{'Two mean±std (ms)':>22} {'Two Spd':>9}"
 )
 
 print(header)
@@ -543,9 +421,7 @@ for r in results:
     print(
         f"{r['n']:5d} {r['m']:5d} {r['T']:6d} | "
         f"{fmt_time(r['t_seq'], r['sd_seq']):>22} | "
-        f"{fmt_time(r['t_two'], r['sd_two']):>22} {r['two_speedup']:9.3f} | "
-        f"{fmt_time(r['t_one'], r['sd_one']):>22} {r['one_speedup']:9.3f} "
-        f"{r['one_vs_two_speedup']:9.3f}"
+        f"{fmt_time(r['t_two'], r['sd_two']):>22} {r['two_speedup']:9.3f}"
     )
 
 
@@ -557,9 +433,7 @@ print("\n================ Accuracy Summary Table ================\n")
 
 header = (
     f"{'n':>5} {'m':>5} | "
-    f"{'Two x err':>12} {'Two lam err':>12} | "
-    f"{'One x err':>12} {'One lam err':>12} | "
-    f"{'One-vs-Two x':>14} {'One-vs-Two lam':>16}"
+    f"{'Two x err':>12} {'Two lam err':>12}"
 )
 
 print(header)
@@ -568,10 +442,7 @@ print("-" * len(header))
 for r in results:
     print(
         f"{r['n']:5d} {r['m']:5d} | "
-        f"{r['two_state_error']:12.3e} {r['two_costate_error']:12.3e} | "
-        f"{r['one_state_error']:12.3e} {r['one_costate_error']:12.3e} | "
-        f"{r['one_vs_two_state_error']:14.3e} "
-        f"{r['one_vs_two_costate_error']:16.3e}"
+        f"{r['two_state_error']:12.3e} {r['two_costate_error']:12.3e}"
     )
 
 
@@ -583,7 +454,7 @@ print("\n================ Newton Step Summary ================\n")
 
 header = (
     f"{'n':>5} {'m':>5} | "
-    f"{'Two fwd':>8} {'Two bwd':>8} {'One':>8} | "
+    f"{'Two fwd':>8} {'Two bwd':>8} | "
     f"{'grad norm':>12}"
 )
 
