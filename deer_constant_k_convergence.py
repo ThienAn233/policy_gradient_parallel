@@ -50,24 +50,23 @@ STATE_DIM = 8       # N
 CONTROL_DIM = 3     # M
 
 T_HORIZON = 300
-NUM_MC_SAMPLES = 64
-NUM_POLICY_ITERS = 50
+NUM_MC_SAMPLES = 512
+NUM_POLICY_ITERS = 10000
 
 # Fixed-J LQR is affine, so one DEER update is usually enough.
-DEER_MAX_ITERS = 1
+DEER_MAX_ITERS = 10
 DEER_TOL = 1e-9
 
-INITIAL_STEP_SIZE = 3e-3
-STABILITY_LIMIT = 0.999
+INITIAL_STEP_SIZE = 1e-2
+STABILITY_LIMIT = 10.999
 
-RESAMPLE_EACH_ITERATION = False
-USE_ANTITHETIC_SAMPLING = True
+RESAMPLE_EACH_ITERATION = True
 
 K_TOL = 1e-4
 GRAD_NORM_TOL = 1e-8
 
-X0_LOW = -1.0
-X0_HIGH = 1.0
+X0_LOW = -.10
+X0_HIGH = .10
 
 PLOT_DIR = Path("lqr_two_pass_deer_arbitrary_nm_results")
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -232,39 +231,12 @@ def parse_deer_result(result):
 # ============================================================
 
 def sample_initial_states(key, sample_count):
-    if not USE_ANTITHETIC_SAMPLING:
-        return jr.uniform(
-            key,
-            shape=(sample_count, STATE_DIM),
-            minval=X0_LOW,
-            maxval=X0_HIGH,
-        )
-
-    if not np.isclose(X0_LOW, -X0_HIGH):
-        raise ValueError("Antithetic sampling requires symmetric bounds.")
-
-    half_count = sample_count // 2
-
-    positive_half = jr.uniform(
+    return jr.uniform(
         key,
-        shape=(half_count, STATE_DIM),
+        shape=(sample_count, STATE_DIM),
         minval=X0_LOW,
         maxval=X0_HIGH,
     )
-
-    samples = jnp.concatenate([positive_half, -positive_half], axis=0)
-
-    if sample_count % 2 == 1:
-        extra = jr.uniform(
-            jr.fold_in(key, 1),
-            shape=(1, STATE_DIM),
-            minval=X0_LOW,
-            maxval=X0_HIGH,
-        )
-        samples = jnp.concatenate([samples, extra], axis=0)
-
-    return samples
-
 
 # ============================================================
 # 7. Two-pass decoupled DEER gradient for one initial state
