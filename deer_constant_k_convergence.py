@@ -36,12 +36,12 @@ from deer_LQR import deer_alg_fixed_j
 SEED = 0
 
 # Start small. Increase later if needed.
-T_HORIZON = 300
-NUM_MC_SAMPLES = 16
+T_HORIZON = 20
+NUM_MC_SAMPLES = 10
 NUM_POLICY_ITERS = 60
 
 # Fixed-J LQR is affine, so one DEER update is usually enough.
-DEER_MAX_ITERS = 1
+DEER_MAX_ITERS = 10
 DEER_TOL = 1e-9
 
 INITIAL_STEP_SIZE = 3e-2
@@ -49,6 +49,9 @@ STABILITY_LIMIT = 0.999
 
 RESAMPLE_EACH_ITERATION = False
 USE_ANTITHETIC_SAMPLING = True
+
+K_TOL = 1e-4
+GRAD_NORM_TOL = 1e-8
 
 X0_LOW = -1.0
 X0_HIGH = 1.0
@@ -222,7 +225,7 @@ def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
     def forward_f(x, dummy):
         return A_cl @ x
 
-    states_guess = 1e-2 * jr.normal(
+    states_guess = jr.normal(
         key_x,
         shape=(T_HORIZON, STATE_DIM),
     )
@@ -254,7 +257,7 @@ def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
     def backward_f(lambda_next, x_k):
         return grad_stage_cost_x(x_k, K) + A_cl.T @ lambda_next
 
-    costate_guess = 1e-2 * jr.normal(
+    costate_guess =  jr.normal(
         key_lam,
         shape=(T_HORIZON, STATE_DIM),
     )
@@ -439,7 +442,7 @@ for iteration in range(NUM_POLICY_ITERS):
         print("Stopping: closed-loop system became unstable.")
         break
 
-    if K_error < 1e-8 and gradient_norm < 1e-8:
+    if K_error < K_TOL and gradient_norm < GRAD_NORM_TOL:
         print("Stopping: gain and gradient tolerances were reached.")
         break
 
