@@ -1,14 +1,24 @@
 """
-lqr_policy_optimization_two_pass_deer_lqr.py
+lqr_two_pass_deer_arbitrary_nm.py
 
-Simple two-pass decoupled fixed-J DEER version.
+Simple two-pass decoupled fixed-J DEER for LQR with arbitrary dimensions.
+
+Shapes:
+    state dimension   N
+    control dimension M
+
+Matrices:
+    A: (N, N)
+    B: (N, M)
+    K: (M, N)
 
 Workflow:
-    1. Compute analytic DARE gain K_star.
-    2. Use forward DEER to compute x_1,...,x_T.
-    3. Use backward DEER to compute lambda_{T-1},...,lambda_0.
-    4. Compute the policy gradient and update K by gradient descent.
-    5. Compare learned K with analytic K_star.
+    1. Generate arbitrary stable A and arbitrary B.
+    2. Compute analytic DARE gain K_star.
+    3. Generate an arbitrary random stabilizing initial gain K_initial.
+    4. Use two-pass fixed-J DEER to compute the policy gradient.
+    5. Update K by gradient descent.
+    6. Compare learned K with K_star.
 
 Requires:
     deer_LQR.py with deer_alg_fixed_j.
@@ -35,13 +45,16 @@ from deer_LQR import deer_alg_fixed_j
 
 SEED = 0
 
-# Start small. Increase later if needed.
-T_HORIZON = 1000
-NUM_MC_SAMPLES = 256
-NUM_POLICY_ITERS = 60
+# Choose arbitrary dimensions here.
+STATE_DIM = 8       # N
+CONTROL_DIM = 3     # M
+
+T_HORIZON = 300
+NUM_MC_SAMPLES = 64
+NUM_POLICY_ITERS = 50
 
 # Fixed-J LQR is affine, so one DEER update is usually enough.
-DEER_MAX_ITERS = 10
+DEER_MAX_ITERS = 1
 DEER_TOL = 1e-9
 
 INITIAL_STEP_SIZE = 3e-3
@@ -56,31 +69,76 @@ GRAD_NORM_TOL = 1e-8
 X0_LOW = -1.0
 X0_HIGH = 1.0
 
-PLOT_DIR = Path("lqr_two_pass_deer_lqr_results")
+PLOT_DIR = Path("lqr_two_pass_deer_arbitrary_nm_results")
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# 2. Linear system and quadratic cost
+# 2. Arbitrary stable system generator
 # ============================================================
 
-A = jnp.array([
-    [-1.0, 0.0, 0.0],
-    [0.0, 0.7, 0.0],
-    [0.0, 0.0, -0.2],
-])
+def make_stable_matrix(key, n, radius=0.85):
+    """
+    Make an arbitrary random stable matrix A with spectral radius near radius.
+    """
+    M = jr.normal(key, shape=(n, n)) / jnp.sqrt(n)
+    eigvals = jnp.linalg.eigvals(M)
+    rho = jnp.max(jnp.abs(eigvals))
+    return M * (radius / (rho + 1e-12))
 
-B = jnp.array([
-    [0.1, 0.1, 0.1],
-    [0.1, 0.1, 0.1],
-    [0.1, 0.1, 0.1],
-])
 
-STATE_DIM = A.shape[0]
-CONTROL_DIM = B.shape[1]
+def make_arbitrary_lqr_system(key, n, m):
+    """
+    Generate arbitrary A, B, Q, R.
 
-Q = jnp.eye(STATE_DIM)
-R = jnp.eye(CONTROL_DIM)
+    A: stable random matrix, shape (n,n)
+    B: random control matrix, shape (n,m)
+    Q: identity, shape (n,n)
+    R: identity, shape (m,m)
+    """
+    key_A, key_B = jr.split(key)
+
+    A = make_stable_matrix(key_A, n, radius=0.85)
+    B = jr.normal(key_B, shape=(n, m)) / jnp.sqrt(max(m, 1))
+
+    Q = jnp.eye(n)
+    R = jnp.eye(m)
+
+    return A, B, Q, R
+
+
+def make_random_stabilizing_gain(key, A, B, n, m, stability_limit=0.999):
+    """
+    Make an arbitrary random initial gain K with shape (m,n), then shrink it
+    until A-BK is stable.
+
+    This keeps K arbitrary/random but avoids starting from an unstable policy.
+    """
+    K = jr.normal(key, shape=(m, n)) / jnp.sqrt(n)
+
+    def rho_of(K_test):
+        eigvals = jnp.linalg.eigvals(A - B @ K_test)
+        return jnp.max(jnp.abs(eigvals))
+
+    scale = 1.0
+    for _ in range(30):
+        K_scaled = scale * K
+        if float(rho_of(K_scaled)) < stability_limit:
+            return K_scaled
+        scale *= 0.5
+
+    # Fall back to zero gain. Since A is stable, this is stable.
+    return jnp.zeros((m, n))
+
+
+master_key = jr.PRNGKey(SEED)
+system_key, init_K_key, sampling_key, optimization_key = jr.split(master_key, 4)
+
+A, B, Q, R = make_arbitrary_lqr_system(
+    system_key,
+    STATE_DIM,
+    CONTROL_DIM,
+)
 
 
 # ============================================================
@@ -104,7 +162,21 @@ K_star = jnp.asarray(K_star_np)
 
 
 # ============================================================
-# 4. Helper functions
+# 4. Initial arbitrary gain
+# ============================================================
+
+K_initial = make_random_stabilizing_gain(
+    init_K_key,
+    A,
+    B,
+    STATE_DIM,
+    CONTROL_DIM,
+    STABILITY_LIMIT,
+)
+
+
+# ============================================================
+# 5. Helper functions
 # ============================================================
 
 def closed_loop_matrix(K):
@@ -156,7 +228,7 @@ def parse_deer_result(result):
 
 
 # ============================================================
-# 5. Sampling
+# 6. Sampling
 # ============================================================
 
 def sample_initial_states(key, sample_count):
@@ -169,9 +241,7 @@ def sample_initial_states(key, sample_count):
         )
 
     if not np.isclose(X0_LOW, -X0_HIGH):
-        raise ValueError(
-            "Antithetic sampling requires symmetric bounds."
-        )
+        raise ValueError("Antithetic sampling requires symmetric bounds.")
 
     half_count = sample_count // 2
 
@@ -197,7 +267,7 @@ def sample_initial_states(key, sample_count):
 
 
 # ============================================================
-# 6. Two-pass decoupled DEER gradient for one initial state
+# 7. Two-pass decoupled DEER gradient for one initial state
 # ============================================================
 
 def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
@@ -257,7 +327,7 @@ def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
     def backward_f(lambda_next, x_k):
         return grad_stage_cost_x(x_k, K) + A_cl.T @ lambda_next
 
-    costate_guess =  jr.normal(
+    costate_guess = jr.normal(
         key_lam,
         shape=(T_HORIZON, STATE_DIM),
     )
@@ -309,10 +379,7 @@ def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
     return gradient, fwd_steps, bwd_steps
 
 
-# ============================================================
-# 7. Monte Carlo DEER gradient
-# ============================================================
-
+# vmap across initial states.
 batched_deer_lqr_two_pass_gradient = jax.jit(
     jax.vmap(
         deer_lqr_two_pass_gradient_single,
@@ -321,21 +388,21 @@ batched_deer_lqr_two_pass_gradient = jax.jit(
     )
 )
 
+
+# ============================================================
+# 8. Monte Carlo DEER gradient
+# ============================================================
+
 def deer_lqr_monte_carlo_gradient(K, x0_samples, key):
     sample_count = int(x0_samples.shape[0])
     guess_keys = jr.split(key, sample_count)
 
-    gradients = []
-    fwd_steps_list = []
-    bwd_steps_list = []
-
-    gradients, _ , _ = batched_deer_lqr_two_pass_gradient(
+    gradients, fwd_steps, bwd_steps = batched_deer_lqr_two_pass_gradient(
         x0_samples,
         K,
         guess_keys,
     )
 
-    gradients = jnp.stack(gradients, axis=0)
     mean_gradient = jnp.mean(gradients, axis=0)
 
     if sample_count > 1:
@@ -343,23 +410,18 @@ def deer_lqr_monte_carlo_gradient(K, x0_samples, key):
     else:
         standard_error = jnp.zeros_like(mean_gradient)
 
-    mean_fwd_steps = float(np.mean(fwd_steps_list)) if fwd_steps_list else None
-    mean_bwd_steps = float(np.mean(bwd_steps_list)) if bwd_steps_list else None
+    mean_fwd_steps = float(jnp.mean(fwd_steps))
+    mean_bwd_steps = float(jnp.mean(bwd_steps))
 
     return mean_gradient, standard_error, mean_fwd_steps, mean_bwd_steps
 
 
 # ============================================================
-# 8. Policy-gradient optimization
+# 9. Policy-gradient optimization
 # ============================================================
-
-K_initial = 0.5 * K_star
 
 if float(spectral_radius(K_initial)) >= STABILITY_LIMIT:
     raise RuntimeError("The chosen initial gain is not strictly stabilizing.")
-
-master_key = jr.PRNGKey(SEED)
-sampling_key, optimization_key = jr.split(master_key)
 
 fixed_samples = sample_initial_states(sampling_key, NUM_MC_SAMPLES)
 
@@ -377,9 +439,15 @@ history = {
     "gradient_standard_error_norm": [],
 }
 
-print("Analytic DARE optimal gain K_star:\n", np.asarray(K_star))
-print("\nInitial gain K_0:\n", np.asarray(K_initial))
-print("\nInitial ||K_0-K_star||_F:", float(jnp.linalg.norm(K_initial - K_star, ord="fro")))
+print(f"STATE_DIM N = {STATE_DIM}")
+print(f"CONTROL_DIM M = {CONTROL_DIM}")
+print("A shape:", A.shape)
+print("B shape:", B.shape)
+print("K shape:", K.shape)
+
+print("\nAnalytic DARE optimal gain K_star shape:", K_star.shape)
+print("Initial arbitrary gain K_initial shape:", K_initial.shape)
+print("\nInitial ||K_0-K_star||_F:", float(jnp.linalg.norm(K_initial - K_star, ord='fro')))
 print("Initial spectral radius:", float(spectral_radius(K_initial)))
 
 start_time = time.perf_counter()
@@ -403,13 +471,15 @@ for iteration in range(NUM_POLICY_ITERS):
 
     step_size = INITIAL_STEP_SIZE
 
-    # Gradient descent. Important: use minus, not plus.
+    # Gradient descent.
     K = K - step_size * gradient
 
     current_radius = float(spectral_radius(K))
 
     K_error = float(jnp.linalg.norm(K - K_star, ord="fro"))
-    K_relative_error = float(K_error / jnp.maximum(jnp.linalg.norm(K_star, ord="fro"), 1e-14))
+    K_relative_error = float(
+        K_error / jnp.maximum(jnp.linalg.norm(K_star, ord="fro"), 1e-14)
+    )
     gradient_norm = float(jnp.linalg.norm(gradient, ord="fro"))
     gradient_se_norm = float(jnp.linalg.norm(gradient_se, ord="fro"))
 
@@ -419,8 +489,8 @@ for iteration in range(NUM_POLICY_ITERS):
     history["gradient_norm"].append(gradient_norm)
     history["spectral_radius"].append(current_radius)
     history["step_size"].append(step_size)
-    history["mean_fwd_steps"].append(np.nan if mean_fwd_steps is None else mean_fwd_steps)
-    history["mean_bwd_steps"].append(np.nan if mean_bwd_steps is None else mean_bwd_steps)
+    history["mean_fwd_steps"].append(mean_fwd_steps)
+    history["mean_bwd_steps"].append(mean_bwd_steps)
     history["gradient_standard_error_norm"].append(gradient_se_norm)
 
     if (
@@ -434,7 +504,8 @@ for iteration in range(NUM_POLICY_ITERS):
             f"relK={K_relative_error:.3e} | "
             f"||grad||_F={gradient_norm:.6e} | "
             f"rho={current_radius:.6f} | "
-            f"step={step_size:.3e}"
+            f"step={step_size:.3e} | "
+            f"steps=({mean_fwd_steps:.1f},{mean_bwd_steps:.1f})"
         )
 
     if current_radius >= STABILITY_LIMIT:
@@ -449,16 +520,21 @@ elapsed = time.perf_counter() - start_time
 
 
 # ============================================================
-# 9. Final comparison
+# 10. Final comparison
 # ============================================================
 
 final_K_error = float(jnp.linalg.norm(K - K_star, ord="fro"))
-final_K_relative_error = float(final_K_error / jnp.maximum(jnp.linalg.norm(K_star, ord="fro"), 1e-14))
+final_K_relative_error = float(
+    final_K_error / jnp.maximum(jnp.linalg.norm(K_star, ord="fro"), 1e-14)
+)
 final_radius = float(spectral_radius(K))
 
 print("\n================ Final Gain Comparison ================\n")
 
-print("Learned gain K:\n", np.asarray(K))
+print("Learned gain K shape:", K.shape)
+print("Analytic DARE gain K_star shape:", K_star.shape)
+
+print("\nLearned gain K:\n", np.asarray(K))
 print("\nAnalytic DARE gain K_star:\n", np.asarray(K_star))
 print("\nGain difference K - K_star:\n", np.asarray(K - K_star))
 print("\nAbsolute gain error |K-K_star|:\n", np.abs(np.asarray(K - K_star)))
@@ -470,7 +546,7 @@ print("Total optimization time:", elapsed, "seconds")
 
 
 # ============================================================
-# 10. Plots
+# 11. Plots
 # ============================================================
 
 def rollout_full_state(x0, K):
@@ -478,7 +554,7 @@ def rollout_full_state(x0, K):
     return jnp.vstack([x_traj, x_T[None, :]])
 
 
-x0_test = jnp.array([1.0, -0.75, 0.5])
+x0_test = jnp.linspace(-1.0, 1.0, STATE_DIM)
 
 trajectory_initial = rollout_full_state(x0_test, K_initial)
 trajectory_final = rollout_full_state(x0_test, K)
@@ -488,7 +564,10 @@ time_axis = np.arange(T_HORIZON + 1)
 iterations = np.asarray(history["iteration"])
 
 np.savez(
-    PLOT_DIR / "lqr_two_pass_deer_lqr_results.npz",
+    PLOT_DIR / "lqr_two_pass_deer_arbitrary_nm_results.npz",
+    A=np.asarray(A),
+    B=np.asarray(B),
+    K_initial=np.asarray(K_initial),
     K_learned=np.asarray(K),
     K_star=np.asarray(K_star),
     K_error=np.asarray(K - K_star),
@@ -503,7 +582,7 @@ plt.figure(figsize=(7, 5))
 plt.semilogy(iterations, history["K_error"], marker="o", markersize=3)
 plt.xlabel("Policy-gradient iteration")
 plt.ylabel(r"$\|K-K^\star\|_F$")
-plt.title("Convergence to analytic DARE gain")
+plt.title(f"Convergence to DARE gain, N={STATE_DIM}, M={CONTROL_DIM}")
 plt.grid(True)
 plt.tight_layout()
 plt.savefig(PLOT_DIR / "gain_error_convergence.png", dpi=200)
@@ -546,7 +625,7 @@ plt.tight_layout()
 plt.savefig(PLOT_DIR / "state_norm_comparison.png", dpi=200)
 plt.show()
 
-plt.figure(figsize=(6, 5))
+plt.figure(figsize=(7, 4))
 plt.imshow(np.asarray(K), aspect="auto")
 plt.colorbar(label="Gain value")
 plt.xlabel("State component")
@@ -556,7 +635,7 @@ plt.tight_layout()
 plt.savefig(PLOT_DIR / "learned_gain.png", dpi=200)
 plt.show()
 
-plt.figure(figsize=(6, 5))
+plt.figure(figsize=(7, 4))
 plt.imshow(np.asarray(K_star), aspect="auto")
 plt.colorbar(label="Gain value")
 plt.xlabel("State component")
@@ -566,7 +645,7 @@ plt.tight_layout()
 plt.savefig(PLOT_DIR / "analytic_gain.png", dpi=200)
 plt.show()
 
-plt.figure(figsize=(6, 5))
+plt.figure(figsize=(7, 4))
 plt.imshow(np.abs(np.asarray(K - K_star)), aspect="auto")
 plt.colorbar(label="Absolute error")
 plt.xlabel("State component")
