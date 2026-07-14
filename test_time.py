@@ -53,24 +53,25 @@ def time_jax(name, fn, warmup=1, repeat=5):
 # ============================================================
 # System Definition
 # ============================================================
-
+k1, k2, k3 = jr.split(jr.PRNGKey(0),3)
 T_max = 300
+N = 4
 
-A = jnp.array([
-    [-1.0, 0.0,  0.0],
-    [ 0.0, 0.7,  0.0],
-    [ 0.0, 0.0, -0.2],
-])
+A = jnp.diag(jax.random.uniform(k1,shape=(N),minval=-1,maxval=1))
+# A = jnp.array([
+#     [-1.0, 0.0,  0.0],
+#     [ 0.0, 0.7,  0.0],
+#     [ 0.0, 0.0, -0.2],
+# ])
 
-B = jnp.array([
-    [0.1, 0.1, 0.1],
-    [0.1, 0.1, 0.1],
-    [0.1, 0.1, 0.1],
-])
+B = jax.random.normal(k2,shape=(N,N))
+# B = jnp.array([
+#     [0.1, 0.1, 0.1],
+#     [0.1, 0.1, 0.1],
+#     [0.1, 0.1, 0.1],
+# ])
 
-key = jr.PRNGKey(0)
-
-K = jax.random.normal(key, shape=(3, 3)) * 0.1
+K = jax.random.normal(k3, shape=(N, N)) * 0.1
 x0 = jnp.array([1.0, 1.0, 1.0])
 
 tol = 1e-7
@@ -115,10 +116,10 @@ def forward_sequential():
 
 states_guess = jax.random.normal(
     jr.PRNGKey(1),
-    shape=(T_max, 3),
+    shape=(T_max, N),
 )
 
-dummy_inputs = jnp.zeros((T_max, 3))
+dummy_inputs = jnp.zeros((T_max, N))
 
 
 def forward_deer():
@@ -171,11 +172,11 @@ def back_step(lambda_next, x_k):
     return lambda_k, lambda_k
 
 
-lambda_T = jnp.zeros(3)
+lambda_T = jnp.zeros(N)
 
 costate_guess = jax.random.normal(
     jr.PRNGKey(2),
-    shape=(T_max, 3),
+    shape=(T_max, N),
 )
 
 
