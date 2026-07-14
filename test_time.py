@@ -21,12 +21,11 @@ def block_until_ready(tree):
     return tree
 
 
-def time_jax(name, fn, warmup=1, repeat=5):
+def time_jax(fn, warmup=1, repeat=5):
     """
     Time a JAX function correctly.
 
-    warmup: first calls compile the function, so do not count them.
-    repeat: number of actual timed runs.
+    The warmup calls compile the function, so they are not counted.
     """
     for _ in range(warmup):
         out = fn()
@@ -46,336 +45,459 @@ def time_jax(name, fn, warmup=1, repeat=5):
     mean_ms = float(jnp.mean(times))
     std_ms = float(jnp.std(times))
 
-    print(f"{name:<42}: {mean_ms:10.3f} ms  ± {std_ms:8.3f} ms")
     return out, mean_ms, std_ms
 
 
 # ============================================================
-# System Definition
+# Stable random system generator
 # ============================================================
-k1, k2, k3 = jr.split(jr.PRNGKey(0),3)
+
+def make_stable_matrix(key, n, radius=0.85):
+    """
+    Generate a random n x n matrix with spectral radius approximately radius.
+    """
+    M = jr.normal(key, shape=(n, n)) / jnp.sqrt(n)
+    eigvals = jnp.linalg.eigvals(M)
+    spectral_radius = jnp.max(jnp.abs(eigvals))
+    return M * (radius / (spectral_radius + 1e-12))
+
+
+def make_system(n, m, seed=0, radius=0.85):
+    """
+    Generate a stable closed-loop linear system.
+
+    State dimension:   n
+    Control dimension: m
+
+    Dynamics:
+        x_{k+1} = A x_k + B u_k
+        u_k     = -K x_k
+
+    Closed-loop:
+        x_{k+1} = (A - B K) x_k
+
+    We generate a stable F_cl first, then choose A = F_cl + B K.
+    This guarantees that A - B K = F_cl is stable.
+    """
+    key = jr.PRNGKey(seed)
+    k1, k2, k3, k4 = jr.split(key, 4)
+
+    F_cl = make_stable_matrix(k1, n, radius=radius)
+
+    B = jr.normal(k2, shape=(n, m)) / jnp.sqrt(m)
+    K = 0.1 * jr.normal(k3, shape=(m, n)) / jnp.sqrt(n)
+
+    A = F_cl + B @ K
+
+    x0 = jnp.ones(n)
+
+    states_guess = jr.normal(k4, shape=(T_max, n))
+
+    dummy_inputs = jnp.zeros((T_max, m))
+
+    return A, B, K, x0, states_guess, dummy_inputs
+
+
+# ============================================================
+# Global experiment settings
+# ============================================================
+
 T_max = 300
-N = 4
-
-A = jnp.diag(jax.random.uniform(k1,shape=(N),minval=-1,maxval=1))
-# A = jnp.array([
-#     [-1.0, 0.0,  0.0],
-#     [ 0.0, 0.7,  0.0],
-#     [ 0.0, 0.0, -0.2],
-# ])
-
-B = jax.random.normal(k2,shape=(N,N))
-# B = jnp.array([
-#     [0.1, 0.1, 0.1],
-#     [0.1, 0.1, 0.1],
-#     [0.1, 0.1, 0.1],
-# ])
-
-K = jax.random.normal(k3, shape=(N, N)) * 0.1
-x0 = jnp.array([1.0, 1.0, 1.0])
-
 tol = 1e-7
 repeat = 5
 warmup = 1
+deer_iters = 50
+
+# Try increasing sizes.
+# Each pair is (state dimension n, control dimension m).
+configs = [
+    (3, 1),
+    (4, 2),
+    (8, 4),
+    (16, 8),
+    (32, 16),
+    # (64, 32),   # uncomment if your machine is strong enough
+]
 
 
 # ============================================================
-# Closed-loop dynamics
+# One benchmark for one (n, m)
 # ============================================================
 
-def f(x, u_dummy):
-    """
-    Closed-loop dynamics:
-
-        x_{k+1} = (A - B K) x_k
-    """
-    return (A - B @ K) @ x
-
-
-# ============================================================
-# Sequential forward rollout
-# ============================================================
-
-def rollout_step(x, _):
-    x_next = f(x, None)
-    return x_next, x_next
-
-
-def forward_sequential():
-    _, states_rollout = jax.lax.scan(
-        rollout_step,
-        x0,
-        jnp.arange(T_max),
+def run_one_benchmark(n, m, seed=0):
+    A, B, K, x0, states_guess, dummy_inputs = make_system(
+        n=n,
+        m=m,
+        seed=seed,
+        radius=0.85,
     )
-    return states_rollout
 
+    lambda_T = jnp.zeros(n)
 
-# ============================================================
-# Parallel / DEER forward rollout
-# ============================================================
-
-states_guess = jax.random.normal(
-    jr.PRNGKey(1),
-    shape=(T_max, N),
-)
-
-dummy_inputs = jnp.zeros((T_max, N))
-
-
-def forward_deer():
-    """
-    DEER forward solve using associative_scan inside deer_alg.
-
-    Use full_trace=False for timing final trajectory only.
-    full_trace=True stores all iterates and is slower.
-    """
-    _, states_deer, newton_steps, *_ = deer_alg(
-        f,
-        x0,
-        states_guess,
-        dummy_inputs,
-        num_iters=T_max,
-        full_trace=False,
-        Ts=None,
-        tol=tol,
+    costate_guess = jr.normal(
+        jr.PRNGKey(seed + 1000),
+        shape=(T_max, n),
     )
-    return states_deer, newton_steps
 
+    x_ref = jnp.ones(n)
 
-# ============================================================
-# Backward costate dynamics
-# ============================================================
+    # ------------------------------------------------------------
+    # Closed-loop dynamics
+    # ------------------------------------------------------------
 
-def backward_costate_step(lambda_next, x_k):
-    """
-    Computes
+    def f(x, u_dummy):
+        """
+        Closed-loop dynamics:
 
-        lambda_k = grad_x l(x_k, K) + F_x^T lambda_{k+1}.
-    """
-    u_k = -K @ x_k
+            u = -K x
+            x_next = A x + B u
 
-    # Example cost:
-    #     l(x, u) = ||x - 1||^2 + ||u||^2
-    #
-    # Since u = -Kx,
-    #     grad_x ||u||^2 = -2 K^T u.
-    grad_x_l = 2 * (x_k - 1.0) - 2 * K.T @ u_k
+        Equivalently:
+
+            x_next = (A - B K) x
+        """
+        u = -K @ x
+        return A @ x + B @ u
 
     F_x_T = (A - B @ K).T
 
-    lambda_k = grad_x_l + F_x_T @ lambda_next
-    return lambda_k
+    # ------------------------------------------------------------
+    # Sequential forward rollout
+    # ------------------------------------------------------------
 
+    def rollout_step(x, _):
+        x_next = f(x, None)
+        return x_next, x_next
 
-def back_step(lambda_next, x_k):
-    lambda_k = backward_costate_step(lambda_next, x_k)
-    return lambda_k, lambda_k
+    def forward_sequential_raw():
+        _, states_rollout = jax.lax.scan(
+            rollout_step,
+            x0,
+            jnp.arange(T_max),
+        )
+        return states_rollout
 
+    forward_sequential = jax.jit(forward_sequential_raw)
 
-lambda_T = jnp.zeros(N)
+    # ------------------------------------------------------------
+    # DEER / parallel forward rollout
+    # ------------------------------------------------------------
 
-costate_guess = jax.random.normal(
-    jr.PRNGKey(2),
-    shape=(T_max, N),
-)
+    def forward_deer_raw():
+        _, states_deer, newton_steps, *_ = deer_alg(
+            f,
+            x0,
+            states_guess,
+            dummy_inputs,
+            num_iters=deer_iters,
+            full_trace=False,
+            Ts=None,
+            tol=tol,
+        )
+        return states_deer, newton_steps
 
+    forward_deer = jax.jit(forward_deer_raw)
 
-def backward_sequential_given_states(states_rollout):
-    """
-    Sequential backward costate pass.
+    # ------------------------------------------------------------
+    # Backward costate dynamics
+    # ------------------------------------------------------------
 
-    Returns costates in reversed order:
+    def backward_costate_step(lambda_next, x_k):
+        """
+        Costate recursion:
 
-        [lambda_{T-1}, ..., lambda_0].
-    """
-    x_traj = jnp.vstack([x0, states_rollout[:-1]])
+            lambda_k = grad_x l(x_k, K) + F_x^T lambda_{k+1}
 
-    _, lambda_traj_rev = jax.lax.scan(
-        back_step,
-        lambda_T,
-        jnp.flip(x_traj, axis=0),
+        Cost:
+
+            l(x, u) = ||x - x_ref||^2 + ||u||^2
+
+        Policy:
+
+            u = -K x
+        """
+        u_k = -K @ x_k
+
+        grad_x_l = 2.0 * (x_k - x_ref) - 2.0 * K.T @ u_k
+
+        lambda_k = grad_x_l + F_x_T @ lambda_next
+
+        return lambda_k
+
+    def back_step(lambda_next, x_k):
+        lambda_k = backward_costate_step(lambda_next, x_k)
+        return lambda_k, lambda_k
+
+    def backward_sequential_given_states_raw(states_rollout):
+        """
+        Returns costates in reverse order:
+
+            [lambda_{T-1}, ..., lambda_0]
+        """
+        x_traj = jnp.vstack([x0, states_rollout[:-1]])
+
+        _, lambda_traj_rev = jax.lax.scan(
+            back_step,
+            lambda_T,
+            jnp.flip(x_traj, axis=0),
+        )
+
+        return lambda_traj_rev
+
+    backward_sequential_given_states = jax.jit(
+        backward_sequential_given_states_raw
     )
 
-    return lambda_traj_rev
+    def backward_deer_given_states_raw(states_rollout):
+        """
+        DEER backward solve.
 
+        Returns costates in reverse order:
 
-def backward_deer_given_states(states_rollout):
-    """
-    DEER backward solve.
+            [lambda_{T-1}, ..., lambda_0]
+        """
+        x_traj = jnp.vstack([x0, states_rollout[:-1]])
+        x_traj_rev = jnp.flip(x_traj, axis=0)
 
-    Returns costates in reversed order:
+        _, costate_deer, newton_steps, *_ = deer_alg(
+            backward_costate_step,
+            lambda_T,
+            costate_guess,
+            x_traj_rev,
+            num_iters=deer_iters,
+            full_trace=False,
+            Ts=None,
+            tol=tol,
+        )
 
-        [lambda_{T-1}, ..., lambda_0].
-    """
-    x_traj = jnp.vstack([x0, states_rollout[:-1]])
-    x_traj_rev = jnp.flip(x_traj, axis=0)
+        return costate_deer, newton_steps
 
-    _, costate_deer, newton_steps, *_ = deer_alg(
-        backward_costate_step,
-        lambda_T,
-        costate_guess,
-        x_traj_rev,
-        num_iters=T_max,
-        full_trace=False,
-        Ts=None,
-        tol=tol,
+    backward_deer_given_states = jax.jit(backward_deer_given_states_raw)
+
+    # ------------------------------------------------------------
+    # Combined forward + backward
+    # ------------------------------------------------------------
+
+    def both_sequential_raw():
+        states_rollout = forward_sequential_raw()
+        lambda_traj_rev = backward_sequential_given_states_raw(states_rollout)
+        return states_rollout, lambda_traj_rev
+
+    both_sequential = jax.jit(both_sequential_raw)
+
+    def both_deer_raw():
+        states_deer, fwd_steps = forward_deer_raw()
+        costate_deer, bwd_steps = backward_deer_given_states_raw(states_deer)
+        return states_deer, costate_deer, fwd_steps, bwd_steps
+
+    both_deer = jax.jit(both_deer_raw)
+
+    # ------------------------------------------------------------
+    # Timing
+    # ------------------------------------------------------------
+
+    states_rollout, t_fwd_seq, sd_fwd_seq = time_jax(
+        forward_sequential,
+        warmup=warmup,
+        repeat=repeat,
     )
 
-    return costate_deer, newton_steps
+    forward_deer_out, t_fwd_deer, sd_fwd_deer = time_jax(
+        forward_deer,
+        warmup=warmup,
+        repeat=repeat,
+    )
+
+    states_deer, fwd_newton_steps = forward_deer_out
+
+    lambda_seq_rev, t_bwd_seq, sd_bwd_seq = time_jax(
+        lambda: backward_sequential_given_states(states_rollout),
+        warmup=warmup,
+        repeat=repeat,
+    )
+
+    backward_deer_out, t_bwd_deer, sd_bwd_deer = time_jax(
+        lambda: backward_deer_given_states(states_rollout),
+        warmup=warmup,
+        repeat=repeat,
+    )
+
+    costate_deer, bwd_newton_steps = backward_deer_out
+
+    both_seq_out, t_both_seq, sd_both_seq = time_jax(
+        both_sequential,
+        warmup=warmup,
+        repeat=repeat,
+    )
+
+    both_deer_out, t_both_deer, sd_both_deer = time_jax(
+        both_deer,
+        warmup=warmup,
+        repeat=repeat,
+    )
+
+    states_seq_both, lambda_seq_both_rev = both_seq_out
+    states_deer_both, lambda_deer_both_rev, fwd_steps_both, bwd_steps_both = both_deer_out
+
+    # ------------------------------------------------------------
+    # Accuracy checks
+    # ------------------------------------------------------------
+
+    forward_error = float(jnp.max(jnp.abs(states_deer - states_rollout)))
+    backward_error = float(jnp.max(jnp.abs(costate_deer - lambda_seq_rev)))
+
+    both_forward_error = float(jnp.max(jnp.abs(states_deer_both - states_seq_both)))
+    both_backward_error = float(jnp.max(jnp.abs(lambda_deer_both_rev - lambda_seq_both_rev)))
+
+    # ------------------------------------------------------------
+    # Policy gradient
+    # ------------------------------------------------------------
+
+    lambda_traj = jnp.flip(lambda_seq_rev, axis=0)
+
+    x_traj = jnp.vstack([x0, states_rollout[:-1]])
+
+    lambda_k_plus_1_traj = jnp.vstack([
+        lambda_traj[1:],
+        lambda_T,
+    ])
+
+    def compute_grad_step(carry, inputs):
+        x_k, lambda_k_plus_1 = inputs
+
+        u_k = -K @ x_k
+
+        # h_u = 2 R u_k + B^T lambda_{k+1}, with R = I
+        h_u = 2.0 * u_k + B.T @ lambda_k_plus_1
+
+        # Since u = -Kx:
+        # grad_K J step = - h_u x_k^T
+        grad_K_step = -jnp.outer(h_u, x_k)
+
+        return carry, grad_K_step
+
+    _, all_K_grads = jax.lax.scan(
+        compute_grad_step,
+        None,
+        (x_traj, lambda_k_plus_1_traj),
+    )
+
+    grad_K = jnp.sum(all_K_grads, axis=0)
+    grad_norm = float(jnp.linalg.norm(grad_K))
+
+    return {
+        "n": n,
+        "m": m,
+        "T": T_max,
+
+        "t_fwd_seq": t_fwd_seq,
+        "t_fwd_deer": t_fwd_deer,
+        "t_bwd_seq": t_bwd_seq,
+        "t_bwd_deer": t_bwd_deer,
+        "t_both_seq": t_both_seq,
+        "t_both_deer": t_both_deer,
+
+        "forward_speedup": t_fwd_seq / t_fwd_deer,
+        "backward_speedup": t_bwd_seq / t_bwd_deer,
+        "both_speedup": t_both_seq / t_both_deer,
+
+        "forward_error": forward_error,
+        "backward_error": backward_error,
+        "both_forward_error": both_forward_error,
+        "both_backward_error": both_backward_error,
+
+        "fwd_newton_steps": int(fwd_newton_steps),
+        "bwd_newton_steps": int(bwd_newton_steps),
+
+        "grad_norm": grad_norm,
+    }
 
 
 # ============================================================
-# Combined forward + backward functions
+# Run all benchmarks
 # ============================================================
 
-def both_sequential():
-    states_rollout = forward_sequential()
-    lambda_traj_rev = backward_sequential_given_states(states_rollout)
-    return states_rollout, lambda_traj_rev
+results = []
 
+print("\n================ Shape Scaling Benchmark ================\n")
 
-def both_deer():
-    states_deer, fwd_steps = forward_deer()
-    costate_deer, bwd_steps = backward_deer_given_states(states_deer)
-    return states_deer, costate_deer, fwd_steps, bwd_steps
+for idx, (n, m) in enumerate(configs):
+    print(f"Running benchmark for n={n}, m={m} ...")
+
+    result = run_one_benchmark(
+        n=n,
+        m=m,
+        seed=idx,
+    )
+
+    results.append(result)
+
+    print(
+        f"  Forward:  seq={result['t_fwd_seq']:.3f} ms, "
+        f"DEER={result['t_fwd_deer']:.3f} ms, "
+        f"speedup={result['forward_speedup']:.3f}x"
+    )
+
+    print(
+        f"  Backward: seq={result['t_bwd_seq']:.3f} ms, "
+        f"DEER={result['t_bwd_deer']:.3f} ms, "
+        f"speedup={result['backward_speedup']:.3f}x"
+    )
+
+    print(
+        f"  Both:     seq={result['t_both_seq']:.3f} ms, "
+        f"DEER={result['t_both_deer']:.3f} ms, "
+        f"speedup={result['both_speedup']:.3f}x"
+    )
+
+    print(
+        f"  Errors: forward={result['forward_error']:.3e}, "
+        f"backward={result['backward_error']:.3e}"
+    )
+
+    print(
+        f"  Newton steps: forward={result['fwd_newton_steps']}, "
+        f"backward={result['bwd_newton_steps']}"
+    )
+
+    print()
 
 
 # ============================================================
-# Run timing comparison
+# Summary table
 # ============================================================
 
-print("\n================ Timing Results ================\n")
+print("\n================ Summary Table ================\n")
 
-states_rollout, t_fwd_seq, _ = time_jax(
-    "Sequential forward rollout",
-    forward_sequential,
-    warmup=warmup,
-    repeat=repeat,
+header = (
+    f"{'n':>5} {'m':>5} {'T':>6} | "
+    f"{'Fwd Seq':>10} {'Fwd DEER':>10} {'Fwd Spd':>9} | "
+    f"{'Bwd Seq':>10} {'Bwd DEER':>10} {'Bwd Spd':>9} | "
+    f"{'Both Seq':>10} {'Both DEER':>10} {'Both Spd':>9}"
 )
 
-forward_deer_out, t_fwd_deer, _ = time_jax(
-    "DEER / parallel forward rollout",
-    forward_deer,
-    warmup=warmup,
-    repeat=repeat,
-)
+print(header)
+print("-" * len(header))
 
-states_deer, fwd_newton_steps = forward_deer_out
-
-lambda_seq_rev, t_bwd_seq, _ = time_jax(
-    "Sequential backward costate",
-    lambda: backward_sequential_given_states(states_rollout),
-    warmup=warmup,
-    repeat=repeat,
-)
-
-backward_deer_out, t_bwd_deer, _ = time_jax(
-    "DEER / parallel backward costate",
-    lambda: backward_deer_given_states(states_rollout),
-    warmup=warmup,
-    repeat=repeat,
-)
-
-costate_deer, bwd_newton_steps = backward_deer_out
-
-both_seq_out, t_both_seq, _ = time_jax(
-    "Sequential forward + backward",
-    both_sequential,
-    warmup=warmup,
-    repeat=repeat,
-)
-
-both_deer_out, t_both_deer, _ = time_jax(
-    "DEER / parallel forward + backward",
-    both_deer,
-    warmup=warmup,
-    repeat=repeat,
-)
-
-states_seq_both, lambda_seq_both_rev = both_seq_out
-states_deer_both, lambda_deer_both_rev, fwd_steps_both, bwd_steps_both = both_deer_out
+for r in results:
+    print(
+        f"{r['n']:5d} {r['m']:5d} {r['T']:6d} | "
+        f"{r['t_fwd_seq']:10.3f} {r['t_fwd_deer']:10.3f} {r['forward_speedup']:9.3f} | "
+        f"{r['t_bwd_seq']:10.3f} {r['t_bwd_deer']:10.3f} {r['backward_speedup']:9.3f} | "
+        f"{r['t_both_seq']:10.3f} {r['t_both_deer']:10.3f} {r['both_speedup']:9.3f}"
+    )
 
 
 # ============================================================
-# Accuracy checks
+# Optional: print accuracy summary
 # ============================================================
 
-print("\n================ Accuracy Checks ================\n")
+print("\n================ Accuracy Summary ================\n")
 
-forward_error = jnp.max(jnp.abs(states_deer - states_rollout))
-backward_error = jnp.max(jnp.abs(costate_deer - lambda_seq_rev))
-
-print("Forward Pass Error  (DEER vs sequential):", forward_error)
-print("Backward Pass Error (DEER vs sequential):", backward_error)
-
-both_forward_error = jnp.max(jnp.abs(states_deer_both - states_seq_both))
-both_backward_error = jnp.max(jnp.abs(lambda_deer_both_rev - lambda_seq_both_rev))
-
-print("Both Forward Error  (DEER vs sequential):", both_forward_error)
-print("Both Backward Error (DEER vs sequential):", both_backward_error)
-
-print("\nForward DEER Newton steps:", fwd_newton_steps)
-print("Backward DEER Newton steps:", bwd_newton_steps)
-
-
-# ============================================================
-# Speedup summary
-# ============================================================
-
-print("\n================ Speedup Summary ================\n")
-
-print(f"Forward speedup:  {t_fwd_seq / t_fwd_deer:8.3f}x")
-print(f"Backward speedup: {t_bwd_seq / t_bwd_deer:8.3f}x")
-print(f"Both speedup:     {t_both_seq / t_both_deer:8.3f}x")
-
-
-# ============================================================
-# Compute Policy Gradient using sequential costates
-# ============================================================
-
-lambda_traj = jnp.flip(lambda_seq_rev, axis=0)
-
-x_traj = jnp.vstack([x0, states_rollout[:-1]])
-
-lambda_k_plus_1_traj = jnp.vstack([
-    lambda_traj[1:],
-    lambda_T,
-])
-
-
-def compute_grad_step(carry, inputs):
-    x_k, lambda_k_plus_1 = inputs
-
-    u_k = -K @ x_k
-
-    # h_u = 2 R u_k + B^T lambda_{k+1}, with R = I
-    h_u = 2 * u_k + B.T @ lambda_k_plus_1
-
-    # Since u = -Kx:
-    #     grad_K u = -x
-    # so:
-    #     grad_K J step = - h_u x_k^T
-    grad_K_step = -jnp.outer(h_u, x_k)
-
-    return carry, grad_K_step
-
-
-_, all_K_grads = jax.lax.scan(
-    compute_grad_step,
-    None,
-    (x_traj, lambda_k_plus_1_traj),
-)
-
-grad_K = jnp.sum(all_K_grads, axis=0)
-
-print("\nGradient w.r.t K:\n", grad_K)
-
-
-# ============================================================
-# Gradient update
-# ============================================================
-
-learning_rate = 1e-4
-K_new = K - learning_rate * grad_K
-
-print("\nUpdated Feedback Matrix K:\n", K_new)
+for r in results:
+    print(
+        f"n={r['n']:3d}, m={r['m']:3d}: "
+        f"forward error={r['forward_error']:.3e}, "
+        f"backward error={r['backward_error']:.3e}, "
+        f"grad norm={r['grad_norm']:.3e}"
+    )
