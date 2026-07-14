@@ -141,7 +141,6 @@ def run_one_benchmark(n, m, seed=0):
         radius=0.85,
     )
 
-    lambda_T = jnp.zeros(n)
     x_ref = jnp.zeros(n)
 
     F_cl = A - B @ K
@@ -159,6 +158,18 @@ def run_one_benchmark(n, m, seed=0):
         """
         u = -K @ x
         return A @ x + B @ u
+
+    def grad_ell_x(x):
+        """
+        Gradient of the stage cost ell(x, K).
+
+        ell(x, K) = ||x - x_ref||^2 + ||u||^2, u = -Kx
+
+        This is also used as the terminal costate:
+            lambda_T = nabla_x ell(x_T, K)
+        """
+        u = -K @ x
+        return 2.0 * (x - x_ref) - 2.0 * K.T @ u
 
     # ------------------------------------------------------------
     # Manual sequential forward rollout
@@ -193,10 +204,7 @@ def run_one_benchmark(n, m, seed=0):
         Policy:
             u = -K x
         """
-        u_k = -K @ x_k
-
-        # grad_x ||x - x_ref||^2 + grad_x ||-Kx||^2
-        grad_x_l = 2.0 * (x_k - x_ref) - 2.0 * K.T @ u_k
+        grad_x_l = grad_ell_x(x_k)
 
         lambda_k = grad_x_l + F_x_T @ lambda_next
 
@@ -210,7 +218,13 @@ def run_one_benchmark(n, m, seed=0):
         """
         Returns costates in reverse order:
             [lambda_{T-1}, ..., lambda_0]
+
+        Terminal condition:
+            lambda_T = nabla_x ell(x_T, K)
         """
+        x_T = states_rollout[-1]
+        lambda_T = grad_ell_x(x_T)
+
         x_traj = jnp.vstack([x0, states_rollout[:-1]])
         _, lambda_traj_rev = jax.lax.scan(
             back_step,
@@ -255,7 +269,13 @@ def run_one_benchmark(n, m, seed=0):
         Backward DEER pass with state trajectory fixed as driver.
 
         states_driver is [x_1, ..., x_T].
+
+        Terminal condition:
+            lambda_T = nabla_x ell(x_T, K)
         """
+        x_T = states_driver[-1]
+        lambda_T = grad_ell_x(x_T)
+
         x_traj = jnp.vstack([x0, states_driver[:-1]])
         x_traj_rev = jnp.flip(x_traj, axis=0)
 
@@ -313,7 +333,14 @@ def run_one_benchmark(n, m, seed=0):
 
     lambda_traj = jnp.flip(lambda_seq_rev, axis=0)
     x_traj = jnp.vstack([x0, states_rollout[:-1]])
-    lambda_k_plus_1_traj = jnp.vstack([lambda_traj[1:], lambda_T])
+
+    # lambda_T = nabla_x ell(x_T, K)
+    lambda_T = grad_ell_x(states_rollout[-1])
+
+    lambda_k_plus_1_traj = jnp.vstack([
+        lambda_traj[1:],
+        lambda_T[None, :],
+    ])
 
     def compute_grad_step(carry, inputs):
         x_k, lambda_k_plus_1 = inputs
