@@ -21,7 +21,7 @@ def block_until_ready(tree):
     return tree
 
 
-def time_jax(fn, warmup=1, repeat=5):
+def time_jax(fn, warmup=1, repeat=10):
     """
     Time a JAX function correctly.
 
@@ -52,7 +52,7 @@ def time_jax(fn, warmup=1, repeat=5):
 # Stable random system generator
 # ============================================================
 
-def make_stable_matrix(key, n, radius=0.85):
+def make_stable_matrix(key, n, radius=0.99):
     """
     Generate a random n x n matrix with spectral radius approximately radius.
     """
@@ -62,7 +62,7 @@ def make_stable_matrix(key, n, radius=0.85):
     return M * (radius / (spectral_radius + 1e-12))
 
 
-def make_system(n, m, seed=0, radius=0.85):
+def make_system(n, m, seed=0, radius=0.99):
     """
     Generate a stable closed-loop linear system.
 
@@ -104,7 +104,7 @@ def make_system(n, m, seed=0, radius=0.85):
 
 T_max = 300
 tol = 1e-7
-repeat = 5
+repeat = 10
 warmup = 1
 deer_iters = 50
 
@@ -112,11 +112,13 @@ deer_iters = 50
 # Each pair is (state dimension n, control dimension m).
 configs = [
     (3, 1),
-    (4, 2),
-    (8, 4),
     (16, 8),
     (32, 16),
-    # (64, 32),   # uncomment if your machine is strong enough
+    (64, 32),
+    (128, 64),  
+    (256, 128),
+    (512, 256),
+    (1024, 512),
 ]
 
 
