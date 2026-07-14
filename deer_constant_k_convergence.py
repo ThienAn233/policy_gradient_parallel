@@ -36,15 +36,15 @@ from deer_LQR import deer_alg_fixed_j
 SEED = 0
 
 # Start small. Increase later if needed.
-T_HORIZON = 20
-NUM_MC_SAMPLES = 10
+T_HORIZON = 1000
+NUM_MC_SAMPLES = 256
 NUM_POLICY_ITERS = 60
 
 # Fixed-J LQR is affine, so one DEER update is usually enough.
 DEER_MAX_ITERS = 10
 DEER_TOL = 1e-9
 
-INITIAL_STEP_SIZE = 3e-2
+INITIAL_STEP_SIZE = 3e-3
 STABILITY_LIMIT = 0.999
 
 RESAMPLE_EACH_ITERATION = False
