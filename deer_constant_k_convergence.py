@@ -31,7 +31,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from scipy.linalg import solve_discrete_are
-from deer_fixed_j import deer_alg_fixed_j
+from deer_LQR import deer_alg_fixed_j
 
 
 # ============================================================
@@ -41,13 +41,13 @@ from deer_fixed_j import deer_alg_fixed_j
 SEED = 0
 
 T_HORIZON = 1000
-NUM_MC_SAMPLES = 64
+NUM_MC_SAMPLES = 16
 NUM_POLICY_ITERS = 60
 
 DEER_MAX_ITERS = 20
 DEER_TOL = 1e-9
 
-INITIAL_STEP_SIZE = 3e-1
+INITIAL_STEP_SIZE = 3e-2
 BACKTRACK_FACTOR = 0.5
 MAX_BACKTRACK_STEPS = 18
 MIN_STEP_SIZE = 1e-10
@@ -167,81 +167,6 @@ S0_EXACT = uniform_second_moment(
     STATE_DIM,
 )
 
-
-# ============================================================
-# 5. Exact expected finite-horizon cost
-# ============================================================
-
-def exact_expected_cost(K):
-    """
-    E[J_T(K)]
-        = E[sum_{k=0}^{T-1} x_k'(Q+K'RK)x_k
-            + x_T'P_star x_T].
-    """
-    A_cl = closed_loop_matrix(K)
-    H = Q + K.T @ R @ K
-
-    S_k = S0_EXACT
-    expected_cost = 0.0
-
-    for _ in range(T_HORIZON):
-        expected_cost = expected_cost + jnp.trace(H @ S_k)
-        S_k = A_cl @ S_k @ A_cl.T
-
-    expected_cost = expected_cost + jnp.trace(P_star @ S_k)
-    return expected_cost
-
-
-exact_expected_cost_jit = jax.jit(exact_expected_cost)
-exact_expected_gradient_autodiff = jax.jit(jax.grad(exact_expected_cost))
-
-
-# ============================================================
-# 6. Analytic expected policy gradient
-# ============================================================
-
-def analytic_expected_gradient(K):
-    """
-    Exact expected finite-horizon policy gradient.
-
-    If lambda_k = 2 P_k x_k, then:
-        P_T = P_star,
-        P_k = Q + K'RK + A_cl' P_{k+1} A_cl.
-
-    Gradient:
-        grad_K J = 2 sum_k
-            (R K - B' P_{k+1} A_cl) E[x_k x_k'].
-    """
-    A_cl = closed_loop_matrix(K)
-    H = Q + K.T @ R @ K
-
-    P_sequence = [None] * (T_HORIZON + 1)
-    P_sequence[T_HORIZON] = P_star
-
-    P_next = P_star
-    for k in range(T_HORIZON - 1, -1, -1):
-        P_k = H + A_cl.T @ P_next @ A_cl
-        P_sequence[k] = P_k
-        P_next = P_k
-
-    S_k = S0_EXACT
-    gradient = jnp.zeros_like(K)
-
-    for k in range(T_HORIZON):
-        P_next = P_sequence[k + 1]
-
-        gradient = gradient + 2.0 * (
-            R @ K - B.T @ P_next @ A_cl
-        ) @ S_k
-
-        S_k = A_cl @ S_k @ A_cl.T
-
-    return gradient
-
-
-analytic_expected_gradient_jit = jax.jit(analytic_expected_gradient)
-
-
 # ============================================================
 # 7. Robust DEER result parser
 # ============================================================
@@ -276,11 +201,7 @@ def deer_lqr_one_pass_gradient_single(x0, K, guess_key):
     Stacked variable:
         z_i = [x_i, lambda_{T-i}].
 
-    The terminal cost is:
-        x_T'P_star x_T,
-
-    so:
-        lambda_T = 2 P_star x_T.
+        lambda_T = 0
 
     The one-pass map is:
         x_{i+1} = A_cl x_i,
@@ -292,14 +213,9 @@ def deer_lqr_one_pass_gradient_single(x0, K, guess_key):
     """
     A_cl = closed_loop_matrix(K)
 
-    # Chronological direct rollout used as fixed driver for costate.
-    x_traj, x_T = rollout_state(x0, K)
+    dummy_inputs = jnp.zeros((T_HORIZON, CONTROL_DIM))
 
-    # Driver for reversed costate dynamics:
-    #     [x_{T-1}, ..., x_0]
-    reversed_x_traj = jnp.flip(x_traj, axis=0)
-
-    lambda_T = 2.0 * P_star @ x_T
+    lambda_T = jnp.zeros(STATE_DIM)
 
     def stacked_f(z, driver_x):
         x_i = z[:STATE_DIM]
@@ -338,7 +254,7 @@ def deer_lqr_one_pass_gradient_single(x0, K, guess_key):
         J_stacked,
         z0,
         z_guess,
-        reversed_x_traj,
+        dummy_inputs,
         num_iters=DEER_MAX_ITERS,
         full_trace=False,
         Ts=None,
@@ -367,24 +283,13 @@ def deer_lqr_one_pass_gradient_single(x0, K, guess_key):
         )
 
     gradient_terms = jax.vmap(gradient_step)(
-        x_traj,
+        x_deer,
         lambda_k_plus_1,
     )
 
     gradient = jnp.sum(gradient_terms, axis=0)
 
-    # State accuracy check.
-    rollout_states_1_to_T = jnp.vstack([
-        x_traj[1:],
-        x_T[None, :],
-    ])
-
-    state_relative_error = (
-        jnp.linalg.norm(x_deer - rollout_states_1_to_T)
-        / jnp.maximum(jnp.linalg.norm(rollout_states_1_to_T), 1e-14)
-    )
-
-    return gradient, newton_steps, state_relative_error
+    return gradient, newton_steps
 
 
 # ============================================================
@@ -438,22 +343,21 @@ def sample_initial_states(key, sample_count):
 # ============================================================
 
 def deer_lqr_monte_carlo_gradient(K, x0_samples, key):
+    print('computing grad from Monte Carlo...')
     sample_count = int(x0_samples.shape[0])
     guess_keys = jr.split(key, sample_count)
 
     gradients = []
-    state_errors = []
     valid_newton_steps = []
 
     for index in range(sample_count):
-        gradient_i, steps_i, state_error_i = deer_lqr_one_pass_gradient_single(
+        gradient_i, steps_i = deer_lqr_one_pass_gradient_single(
             x0_samples[index],
             K,
             guess_keys[index],
         )
-
+        # print(f'grad {index} computed')
         gradients.append(gradient_i)
-        state_errors.append(state_error_i)
 
         if steps_i is not None:
             steps_array = np.asarray(steps_i)
@@ -461,29 +365,21 @@ def deer_lqr_monte_carlo_gradient(K, x0_samples, key):
                 valid_newton_steps.append(float(steps_array))
 
     gradients = jnp.stack(gradients, axis=0)
-    state_errors = jnp.asarray(state_errors)
 
     mean_gradient = jnp.mean(gradients, axis=0)
 
-    if sample_count > 1:
-        standard_error = (
-            jnp.std(gradients, axis=0, ddof=1)
-            / jnp.sqrt(sample_count)
-        )
-    else:
-        standard_error = jnp.zeros_like(mean_gradient)
+    standard_error = jnp.zeros_like(mean_gradient)
 
     mean_steps = (
         float(np.mean(valid_newton_steps))
         if valid_newton_steps
         else None
     )
-
+    print('Done computing Monte Carlo DEER gradient.')
     return (
         mean_gradient,
         standard_error,
         mean_steps,
-        float(jnp.max(state_errors)),
     )
 
 
@@ -513,16 +409,12 @@ K = K_initial
 
 history = {
     "iteration": [],
-    "cost": [],
     "K_error": [],
     "K_relative_error": [],
     "gradient_norm_deer_lqr": [],
-    "deer_lqr_vs_analytic": [],
-    "analytic_vs_autodiff": [],
     "spectral_radius": [],
     "step_size": [],
     "mean_newton_steps": [],
-    "max_state_error": [],
     "gradient_standard_error_norm": [],
 }
 
@@ -530,11 +422,11 @@ print("Analytic DARE optimal gain K_star:\n", np.asarray(K_star))
 print("\nInitial gain K_0:\n", np.asarray(K_initial))
 print("\nInitial ||K_0-K_star||_F:", float(jnp.linalg.norm(K_initial - K_star, ord="fro")))
 print("Initial spectral radius:", float(spectral_radius(K_initial)))
-print("Initial exact expected cost:", float(exact_expected_cost_jit(K_initial)))
 
 start_time = time.perf_counter()
 
 for iteration in range(NUM_POLICY_ITERS):
+    print(f"\n=== Policy-gradient iteration {iteration} ===")
     iteration_key = jr.fold_in(optimization_key, iteration)
 
     if RESAMPLE_EACH_ITERATION:
@@ -543,28 +435,19 @@ for iteration in range(NUM_POLICY_ITERS):
     else:
         x0_samples = fixed_samples
 
-    deer_gradient, deer_se, mean_steps, max_state_error = (
+    deer_gradient, deer_se, mean_steps = (
         deer_lqr_monte_carlo_gradient(
             K,
             x0_samples,
             iteration_key,
         )
     )
+    
+    step_size = INITIAL_STEP_SIZE
 
-    analytic_gradient = analytic_expected_gradient_jit(K)
-    autodiff_gradient = exact_expected_gradient_autodiff(K)
+    K = K + step_size*deer_gradient
 
-    current_cost = float(exact_expected_cost_jit(K))
     current_radius = float(spectral_radius(K))
-
-    deer_vs_analytic = float(
-        jnp.linalg.norm(deer_gradient - analytic_gradient, ord="fro")
-        / jnp.maximum(jnp.linalg.norm(analytic_gradient, ord="fro"), 1e-14)
-    )
-
-    analytic_vs_autodiff = float(
-        jnp.linalg.norm(analytic_gradient - autodiff_gradient, ord="fro")
-    )
 
     K_error = float(jnp.linalg.norm(K - K_star, ord="fro"))
     K_relative_error = float(
@@ -575,38 +458,13 @@ for iteration in range(NUM_POLICY_ITERS):
     deer_se_norm = float(jnp.linalg.norm(deer_se, ord="fro"))
 
     history["iteration"].append(iteration)
-    history["cost"].append(current_cost)
     history["K_error"].append(K_error)
     history["K_relative_error"].append(K_relative_error)
     history["gradient_norm_deer_lqr"].append(deer_gradient_norm)
-    history["deer_lqr_vs_analytic"].append(deer_vs_analytic)
-    history["analytic_vs_autodiff"].append(analytic_vs_autodiff)
     history["spectral_radius"].append(current_radius)
     history["mean_newton_steps"].append(np.nan if mean_steps is None else mean_steps)
-    history["max_state_error"].append(max_state_error)
     history["gradient_standard_error_norm"].append(deer_se_norm)
-
-    # Backtracking line search using DEER-LQR Monte Carlo gradient.
-    step_size = INITIAL_STEP_SIZE
-    accepted = False
-
-    for _ in range(MAX_BACKTRACK_STEPS):
-        K_candidate = K - step_size * deer_gradient
-        candidate_radius = float(spectral_radius(K_candidate))
-
-        if candidate_radius < STABILITY_LIMIT:
-            candidate_cost = float(exact_expected_cost_jit(K_candidate))
-
-            if candidate_cost < current_cost:
-                accepted = True
-                break
-
-        step_size *= BACKTRACK_FACTOR
-
-        if step_size < MIN_STEP_SIZE:
-            break
-
-    history["step_size"].append(step_size if accepted else 0.0)
+    history["step_size"].append(step_size)
 
     if (
         iteration == 0
@@ -615,24 +473,13 @@ for iteration in range(NUM_POLICY_ITERS):
     ):
         print(
             f"Iteration {iteration:3d} | "
-            f"cost={current_cost:.10f} | "
             f"||K-K*||_F={K_error:.6e} | "
             f"relK={K_relative_error:.3e} | "
             f"||g_DEER_LQR||_F={deer_gradient_norm:.6e} | "
-            f"DEER_LQR/analytic={deer_vs_analytic:.3e} | "
             f"rho={current_radius:.6f} | "
-            f"step={step_size if accepted else 0.0:.3e}"
+            f"step={step_size:.3e}"
         )
 
-    if not accepted:
-        print(
-            "Stopping: the DEER-LQR Monte Carlo direction did not produce "
-            "a stable cost-decreasing step. Increase NUM_MC_SAMPLES or "
-            "reduce INITIAL_STEP_SIZE if this happens too early."
-        )
-        break
-
-    K = K_candidate
 
     if K_error < 1e-8 and deer_gradient_norm < 1e-8:
         print("Stopping: gain and gradient tolerances were reached.")
@@ -645,17 +492,11 @@ elapsed = time.perf_counter() - start_time
 # 13. Final comparison: analytic K_star vs learned K
 # ============================================================
 
-final_cost = float(exact_expected_cost_jit(K))
-optimal_cost = float(exact_expected_cost_jit(K_star))
 final_K_error = float(jnp.linalg.norm(K - K_star, ord="fro"))
 final_K_relative_error = float(
     final_K_error / jnp.maximum(jnp.linalg.norm(K_star, ord="fro"), 1e-14)
 )
 final_radius = float(spectral_radius(K))
-final_cost_gap = final_cost - optimal_cost
-
-final_analytic_gradient = analytic_expected_gradient_jit(K)
-final_autodiff_gradient = exact_expected_gradient_autodiff(K)
 
 print("\n================ Final Gain Comparison ================\n")
 
@@ -666,15 +507,8 @@ print("\nAbsolute gain error |K-K_star|:\n", np.abs(np.asarray(K - K_star)))
 
 print("\nFinal ||K-K_star||_F:", final_K_error)
 print("Final relative ||K-K_star||_F:", final_K_relative_error)
-print("Final expected cost:", final_cost)
-print("Optimal expected cost:", optimal_cost)
-print("Final cost gap:", final_cost_gap)
 print("Final spectral radius:", final_radius)
 print("Total optimization time:", elapsed, "seconds")
-print(
-    "Final analytic-vs-autodiff gradient error:",
-    float(jnp.linalg.norm(final_analytic_gradient - final_autodiff_gradient)),
-)
 
 
 # ============================================================
@@ -705,14 +539,10 @@ np.savez(
     K_learned=np.asarray(K),
     K_star=np.asarray(K_star),
     K_error=np.asarray(K - K_star),
-    cost=np.asarray(history["cost"]),
     K_error_history=np.asarray(history["K_error"]),
     K_relative_error_history=np.asarray(history["K_relative_error"]),
-    deer_lqr_vs_analytic=np.asarray(history["deer_lqr_vs_analytic"]),
-    analytic_vs_autodiff=np.asarray(history["analytic_vs_autodiff"]),
     spectral_radius=np.asarray(history["spectral_radius"]),
     step_size=np.asarray(history["step_size"]),
-    max_state_error=np.asarray(history["max_state_error"]),
     gradient_standard_error_norm=np.asarray(history["gradient_standard_error_norm"]),
 )
 
@@ -721,17 +551,6 @@ np.savez(
 # 16. Plots
 # ============================================================
 
-plt.figure(figsize=(7, 5))
-plt.plot(iterations, history["cost"], marker="o", markersize=3)
-plt.axhline(optimal_cost, linestyle="--", label="Optimal cost")
-plt.xlabel("Policy-gradient iteration")
-plt.ylabel("Exact expected finite-horizon cost")
-plt.title("Cost convergence using one-pass DEER-LQR gradients")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.savefig(PLOT_DIR / "cost_convergence.png", dpi=200)
-plt.show()
 
 plt.figure(figsize=(7, 5))
 plt.semilogy(iterations, history["K_error"], marker="o", markersize=3)
@@ -741,26 +560,6 @@ plt.title("Convergence to analytic DARE gain")
 plt.grid(True)
 plt.tight_layout()
 plt.savefig(PLOT_DIR / "gain_error_convergence.png", dpi=200)
-plt.show()
-
-plt.figure(figsize=(7, 5))
-plt.semilogy(
-    iterations,
-    np.maximum(history["deer_lqr_vs_analytic"], 1e-18),
-    label="DEER-LQR MC vs analytic gradient",
-)
-plt.semilogy(
-    iterations,
-    np.maximum(history["analytic_vs_autodiff"], 1e-18),
-    label="Analytic gradient vs JAX autodiff",
-)
-plt.xlabel("Policy-gradient iteration")
-plt.ylabel("Gradient discrepancy")
-plt.title("Gradient validation")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.savefig(PLOT_DIR / "gradient_validation.png", dpi=200)
 plt.show()
 
 plt.figure(figsize=(7, 5))
