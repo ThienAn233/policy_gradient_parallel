@@ -465,6 +465,5 @@ for r in results:
     print(
         f"{r['n']:5d} {r['m']:5d} | "
         f"{r['fwd_newton_steps']:8d} {r['bwd_newton_steps']:8d} "
-        f"{r['one_newton_steps']:8d} | "
         f"{r['grad_norm']:12.3e}"
     )
