@@ -327,7 +327,7 @@ def deer_lqr_monte_carlo_gradient(K, x0_samples, key):
             K,
             guess_keys[index],
         )
-
+        print(f'Gradient at step: {index}')
         gradients.append(gradient_i)
 
         if fwd_steps_i is not None:
