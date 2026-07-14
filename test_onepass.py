@@ -5,7 +5,7 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import jax.random as jr
-from deer import deer_alg
+from deer_LQR import deer_alg_fixed_j
 
 
 # ============================================================
@@ -174,8 +174,9 @@ dummy_inputs = jnp.zeros((T_max, D))
 
 @jax.jit
 def deer_forward_pass():
-    _, states_deer, newton_steps, *_ = deer_alg(
+    _, states_deer, newton_steps, *_ = deer_alg_fixed_j(
         f,
+        F_cl,
         x0,
         states_guess,
         dummy_inputs,
@@ -198,8 +199,9 @@ def deer_backward_pass(states_driver):
 
     x_traj_rev = jnp.flip(x_traj, axis=0)
 
-    _, costate_deer, newton_steps, *_ = deer_alg(
+    _, costate_deer, newton_steps, *_ = deer_alg_fixed_j(
         backward_costate_step,
+        F_cl_T,
         lambda_T,
         costate_guess,
         x_traj_rev,
@@ -290,8 +292,12 @@ def deer_one_pass_decoupled_fixed_driver(states_driver):
     """
     x_rev_driver = make_one_pass_driver(states_driver)
 
-    _, z_deer, newton_steps, *_ = deer_alg(
+    _, z_deer, newton_steps, *_ = deer_alg_fixed_j(
         f_augmented,
+        jnp.block([
+            [F_cl, jnp.zeros((D, D))],
+            [jnp.zeros((D, D)), F_cl_T],
+        ]),
         z0,
         z_guess,
         x_rev_driver,
