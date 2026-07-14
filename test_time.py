@@ -148,7 +148,7 @@ def run_one_benchmark(n, m, seed=0):
     )
 
     lambda_T = jnp.zeros(n)
-    x_ref = jnp.ones(n)
+    x_ref = jnp.zeros(n)
 
     F_cl = A - B @ K
     F_x_T = F_cl.T

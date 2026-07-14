@@ -18,11 +18,11 @@ from deer import deer_alg
 SEED = 0
 
 # Finite horizon used by DEER and by the analytic comparison.
-T_HORIZON = 60
+T_HORIZON = 1000
 
 # Number of initial states used in each DEER Monte Carlo gradient.
 # Runtime scales approximately linearly with this number.
-NUM_MC_SAMPLES = 24
+NUM_MC_SAMPLES = 64
 
 # Number of policy-gradient iterations.
 NUM_POLICY_ITERS = 60
@@ -32,7 +32,7 @@ DEER_MAX_ITERS = 20
 DEER_TOL = 1e-9
 
 # Backtracking gradient-descent settings.
-INITIAL_STEP_SIZE = 3e-2
+INITIAL_STEP_SIZE = 3e-1
 BACKTRACK_FACTOR = 0.5
 MAX_BACKTRACK_STEPS = 18
 MIN_STEP_SIZE = 1e-10
@@ -350,7 +350,7 @@ def deer_gradient_single(x0, K, guess_key):
         z_guess,
         reversed_x_traj,
         num_iters=DEER_MAX_ITERS,
-        full_trace=True,
+        full_trace=False,
         Ts=None,
         tol=DEER_TOL,
     )
