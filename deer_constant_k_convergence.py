@@ -69,7 +69,7 @@ X0_LOW = -.10
 X0_HIGH = .10
 
 PLOT_DIR = Path("lqr_two_pass_deer_arbitrary_nm_results")
-PLOT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=False, exist_ok=True)
 
 
 # ============================================================
@@ -253,10 +253,9 @@ def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
         lambda_k = grad_x l(x_k,K) + A_cl' lambda_{k+1}
 
     Terminal costate:
-        lambda_T = 0.
+        lambda_T = nabla_x J = nabla_x ell.
     """
     A_cl = closed_loop_matrix(K)
-    lambda_T = jnp.zeros(STATE_DIM)
 
     key_x, key_lam = jr.split(guess_key)
 
@@ -305,7 +304,7 @@ def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
     )
 
     x_traj_rev = jnp.flip(x_traj, axis=0)
-
+    lambda_T = grad_stage_cost_x(x_traj_rev[0],K)
     backward_result = deer_alg_fixed_j(
         backward_f,
         A_cl.T,

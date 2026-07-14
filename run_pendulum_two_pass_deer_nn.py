@@ -41,15 +41,15 @@ import pendulum_env_jax as penv
 # ============================================================
 
 SEED = 0
-T_HORIZON = 200          # Gymnasium Pendulum-v1 truncates at 200 steps
-NUM_MC_SAMPLES = 4       # keep small first
-NUM_POLICY_ITERS = 30
+T_HORIZON = 500          # Gymnasium Pendulum-v1 truncates at 200 steps
+NUM_MC_SAMPLES = 512       # keep small first
+NUM_POLICY_ITERS = 300
 
-DEER_MAX_ITERS = 15
+DEER_MAX_ITERS = 500
 DEER_TOL = 1e-8
 
-LEARNING_RATE = 1e-4
-GRAD_CLIP_NORM = 50.0
+LEARNING_RATE = 1e-7
+GRAD_CLIP_NORM = 1.e20
 
 HIDDEN_DIM = 16
 
@@ -123,7 +123,7 @@ def two_pass_deer_gradient_single(x0, params, key):
         return penv.pendulum_step(x, params)
 
     # Simple initial guess: repeat x0 with small noise.
-    states_guess = jnp.tile(x0, (T_HORIZON, 1)) + 1e-2 * jr.normal(
+    states_guess = 1e-2 * jr.normal(
         key_x,
         shape=(T_HORIZON, penv.STATE_DIM),
     )
@@ -151,8 +151,6 @@ def two_pass_deer_gradient_single(x0, params, key):
     # Pass 2: backward DEER for costate trajectory
     # ------------------------------------------------------------
 
-    lambda_T = jnp.zeros(penv.STATE_DIM)
-
     def grad_stage_x(x):
         return jax.grad(lambda y: penv.stage_cost(y, params))(x)
 
@@ -168,6 +166,8 @@ def two_pass_deer_gradient_single(x0, params, key):
     )
 
     x_traj_rev = jnp.flip(x_traj, axis=0)
+
+    lambda_T = grad_stage_x(x_traj_rev[0])
 
     backward_result = deer_alg(
         backward_f,
