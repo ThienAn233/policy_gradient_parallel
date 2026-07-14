@@ -313,6 +313,14 @@ def deer_lqr_two_pass_gradient_single(x0, K, guess_key):
 # 7. Monte Carlo DEER gradient
 # ============================================================
 
+batched_deer_lqr_two_pass_gradient = jax.jit(
+    jax.vmap(
+        deer_lqr_two_pass_gradient_single,
+        in_axes=(0, None, 0),
+        out_axes=(0, 0, 0),
+    )
+)
+
 def deer_lqr_monte_carlo_gradient(K, x0_samples, key):
     sample_count = int(x0_samples.shape[0])
     guess_keys = jr.split(key, sample_count)
@@ -321,20 +329,11 @@ def deer_lqr_monte_carlo_gradient(K, x0_samples, key):
     fwd_steps_list = []
     bwd_steps_list = []
 
-    for index in range(sample_count):
-        gradient_i, fwd_steps_i, bwd_steps_i = deer_lqr_two_pass_gradient_single(
-            x0_samples[index],
-            K,
-            guess_keys[index],
-        )
-        print(f'Gradient at step: {index}')
-        gradients.append(gradient_i)
-
-        if fwd_steps_i is not None:
-            fwd_steps_list.append(float(np.asarray(fwd_steps_i)))
-
-        if bwd_steps_i is not None:
-            bwd_steps_list.append(float(np.asarray(bwd_steps_i)))
+    gradients, _ , _ = batched_deer_lqr_two_pass_gradient(
+        x0_samples,
+        K,
+        guess_keys,
+    )
 
     gradients = jnp.stack(gradients, axis=0)
     mean_gradient = jnp.mean(gradients, axis=0)
