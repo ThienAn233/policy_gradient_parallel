@@ -42,13 +42,13 @@ import pendulum_env_jax as penv
 
 SEED = 0
 T_HORIZON = 500          # Gymnasium Pendulum-v1 truncates at 200 steps
-NUM_MC_SAMPLES = 512       # keep small first
+NUM_MC_SAMPLES = 1024       # keep small first
 NUM_POLICY_ITERS = 300
 
-DEER_MAX_ITERS = 500
+DEER_MAX_ITERS = 5000
 DEER_TOL = 1e-8
 
-LEARNING_RATE = 1e-7
+LEARNING_RATE = 1e-8
 GRAD_CLIP_NORM = 1.e20
 
 HIDDEN_DIM = 16
@@ -123,7 +123,7 @@ def two_pass_deer_gradient_single(x0, params, key):
         return penv.pendulum_step(x, params)
 
     # Simple initial guess: repeat x0 with small noise.
-    states_guess = 1e-2 * jr.normal(
+    states_guess = jr.normal(
         key_x,
         shape=(T_HORIZON, penv.STATE_DIM),
     )
@@ -160,7 +160,7 @@ def two_pass_deer_gradient_single(x0, params, key):
     def backward_f(lambda_next, x_k):
         return grad_stage_x(x_k) + F_x(x_k).T @ lambda_next
 
-    costate_guess = 1e-2 * jr.normal(
+    costate_guess = jr.normal(
         key_lam,
         shape=(T_HORIZON, penv.STATE_DIM),
     )
