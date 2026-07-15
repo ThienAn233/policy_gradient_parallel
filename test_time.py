@@ -5,6 +5,10 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
 from deer_LQR import deer_alg_fixed_j
 
 
@@ -115,16 +119,20 @@ repeat = 10
 warmup = 1
 deer_iters = 50
 
-# Each pair is (state dimension n, control dimension m).
+PLOT_DIR = Path("deer_shape_speedup_heatmap_results")
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Heatmap grid.
+# x-axis: state dimension n
+# y-axis: control dimension m
+STATE_SIZES = [3, 16, 32, 64, 128, 256, 512]
+CONTROL_SIZES = [1, 4, 8, 16, 32, 64, 128, 256]
+
+# Run every combination so the heatmap is rectangular.
 configs = [
-    (3, 1),
-    (16, 8),
-    (32, 16),
-    (64, 32),
-    (128, 64),
-    (256, 128),
-    (512, 256),
-    # (1024, 512),
+    (n, m)
+    for m in CONTROL_SIZES
+    for n in STATE_SIZES
 ]
 
 
@@ -392,6 +400,12 @@ def run_one_benchmark(n, m, seed=0):
 
 results = []
 
+speedup_grid = np.full(
+    (len(CONTROL_SIZES), len(STATE_SIZES)),
+    np.nan,
+    dtype=float,
+)
+
 print("\n================ Two-Pass DEER Shape Scaling Benchmark ================\n")
 print("Methods:")
 print("  1. Sequential baseline")
@@ -408,6 +422,10 @@ for idx, (n, m) in enumerate(configs):
     )
 
     results.append(result)
+
+    m_index = CONTROL_SIZES.index(m)
+    n_index = STATE_SIZES.index(n)
+    speedup_grid[m_index, n_index] = result["two_speedup"]
 
     print(f"  Sequential: {fmt_time(result['t_seq'], result['sd_seq'])} ms")
 
@@ -494,3 +512,77 @@ for r in results:
         f"{r['fwd_newton_steps']:8d} {r['bwd_newton_steps']:8d} "
         f"{r['grad_norm']:12.3e}"
     )
+
+# ============================================================
+# Heatmap: speedup versus sequential rollout
+# ============================================================
+
+print("\n================ Speedup Heatmap ================\n")
+print("Rows: control dimension m")
+print("Columns: state dimension n")
+print(speedup_grid)
+
+np.savez(
+    PLOT_DIR / "speedup_heatmap_data.npz",
+    state_sizes=np.asarray(STATE_SIZES),
+    control_sizes=np.asarray(CONTROL_SIZES),
+    speedup_grid=speedup_grid,
+    results=np.asarray([
+        (
+            r["n"],
+            r["m"],
+            r["T"],
+            r["t_seq"],
+            r["sd_seq"],
+            r["t_two"],
+            r["sd_two"],
+            r["two_speedup"],
+            r["two_state_error"],
+            r["two_costate_error"],
+            r["fwd_newton_steps"],
+            r["bwd_newton_steps"],
+            r["grad_norm"],
+        )
+        for r in results
+    ], dtype=float),
+)
+
+plt.figure(figsize=(10, 6))
+image = plt.imshow(speedup_grid, aspect="auto", origin="lower")
+
+plt.colorbar(image, label="Speedup vs sequential rollout (x)")
+
+plt.xticks(
+    ticks=np.arange(len(STATE_SIZES)),
+    labels=[str(n) for n in STATE_SIZES],
+)
+
+plt.yticks(
+    ticks=np.arange(len(CONTROL_SIZES)),
+    labels=[str(m) for m in CONTROL_SIZES],
+)
+
+plt.xlabel("State dimension n")
+plt.ylabel("Control dimension m")
+plt.title("Two-pass DEER speedup over sequential rollout")
+
+# Annotate each cell with the speedup value.
+for i, m in enumerate(CONTROL_SIZES):
+    for j, n in enumerate(STATE_SIZES):
+        value = speedup_grid[i, j]
+        if np.isfinite(value):
+            plt.text(
+                j,
+                i,
+                f"{value:.2f}x",
+                ha="center",
+                va="center",
+                fontsize=8,
+            )
+
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "two_pass_deer_speedup_heatmap.png", dpi=200)
+plt.show()
+
+print(f"\nSaved heatmap to: {PLOT_DIR.resolve() / 'two_pass_deer_speedup_heatmap.png'}")
+print(f"Saved heatmap data to: {PLOT_DIR.resolve() / 'speedup_heatmap_data.npz'}")
