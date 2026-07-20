@@ -138,8 +138,9 @@ def energy_shaping_controller(x, params: PendulumParams, gains: EnergyShapingGai
     # )
 
     # u = jnp.where(use_pd, u_pd, u_energy)
-    u = u_energy
-    return u + 0*jnp.clip(u, -params.u_max, params.u_max)
+    u = u_energy + u_pd
+    u = -2*params.m * params.g * params.l * jnp.sin(theta)-2*omega
+    return jnp.clip(u, -params.u_max, params.u_max)
 
 
 def simulate_closed_loop(x0, params: PendulumParams, gains: EnergyShapingGains, horizon):
@@ -325,11 +326,11 @@ def main():
         g=9.81,
         b=0.05,
         dt=0.02,
-        u_max=5.0,
+        u_max=50.0,
     )
 
     gains = EnergyShapingGains(
-        k_energy=100.0,
+        k_energy=2.0,
         k_p=35.0,
         k_d=8.0,
         switch_angle=0.35,
