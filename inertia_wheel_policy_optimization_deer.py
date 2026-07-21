@@ -55,17 +55,17 @@ from deer import deer_alg
 # =============================================================================
 SEED = 0
 
-DT = 0.02
-T_HORIZON = 250
+DT = 0.01
+T_HORIZON = 1000
 NUM_MC_SAMPLES = 128
-NUM_POLICY_ITERS = 200
+NUM_POLICY_ITERS = 20000
 
 DEER_MAX_ITERS = 5000
 DEER_TOL = 1.0e-8
 
 # The gradient formula is a sum over the full horizon, so begin with a small
 # learning rate. This is ordinary gradient descent, not Adam.
-LEARNING_RATE = 1.0e-8
+LEARNING_RATE = 1.0e-5
 
 PRINT_EVERY = 5
 RESULTS_DIR = Path("inertia_wheel_two_pass_deer_mc_results")
@@ -91,9 +91,9 @@ g = DT * g_c
 
 # Running cost l(x, theta) = x^T Q x + R pi(x, theta)^2.
 # DT makes the finite sum approximate a continuous-time integral.
-Q = DT * jnp.diag(jnp.array([12.0, 0.15, 0.20, 0.08]))
-R = DT * 2.0e-3
-Q_f = jnp.diag(jnp.array([40.0, 0.50, 1.00, 0.30]))
+Q = DT * jnp.diag(jnp.array([12.0, 15, 0.20, 0.08]))
+R = DT * 2.0
+Q_f = Q
 
 # Initial controller values from the paper example.
 theta_initial = jnp.array([1.0, -1.5, 6.0, 3.75, 10.0])
