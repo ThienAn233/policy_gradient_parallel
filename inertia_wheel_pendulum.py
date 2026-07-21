@@ -116,7 +116,7 @@ def simulate(x_initial):
     return jnp.vstack((x_initial, x_history))
 
 
-x = simulate(x_0)
+x = sim-ulate(x_0)
 t = jnp.linspace(t_0, t_f, num_steps + 1)
 u = jax.vmap(ida_pbc)(x)
 
