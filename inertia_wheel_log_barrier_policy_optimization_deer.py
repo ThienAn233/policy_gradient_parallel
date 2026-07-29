@@ -32,6 +32,8 @@ Required files/packages:
 """
 
 from __future__ import annotations
+from collections.abc import Callable, Sequence
+from typing import Optional
 
 import time
 from pathlib import Path
@@ -66,15 +68,20 @@ DEER_TOL = 1.0e-8
 # The gradient formula is a sum over the full horizon, so begin with a small
 # learning rate. This is ordinary gradient descent, not Adam.
 LEARNING_RATE = 1.0e-5
+BARRIER_COEFFICIENT = 1.0e-2
+FEASIBILITY_MARGIN = 1.0e-8
+BACKTRACKING_FACTOR = 0.5
+MAX_BACKTRACKING_STEPS = 20
 
 PRINT_EVERY = 5
-RESULTS_DIR = Path("inertia_wheel_two_pass_deer_mc_results")
+RESULTS_DIR = Path("inertia_wheel_log_barrier_two_pass_deer_mc_results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_DIM = 4
 PARAM_DIM = 5
 
-
+ConditionFunction = Callable[[jax.Array], jax.Array]
+ConditionGradientFunction = Callable[[jax.Array], jax.Array]
 # =============================================================================
 # Inertia-wheel pendulum model and IDA-PBC policy
 # =============================================================================
@@ -98,6 +105,130 @@ Q_f = Q
 # Initial controller values from the paper example.
 theta_initial = jnp.array([1.0, -1.5, 6.0, 3.75, 10.0])
 
+# ---------------------------------------------------------
+# Condition functions h_i(theta) > 0
+# ---------------------------------------------------------
+
+def condition_a1_positive(theta: jax.Array) -> jax.Array:
+    """Condition h_1(theta) = a_1 > 0."""
+    a_1 = theta[0]
+    return a_1
+
+
+def condition_md_determinant(theta: jax.Array) -> jax.Array:
+    """
+    Condition h_2(theta) = det(M_d) > 0, where
+
+        M_d = [[a_1, a_2],
+               [a_2, a_3]].
+    """
+    a_1, a_2, a_3 = theta[:3]
+    return a_1 * a_3 - a_2**2
+
+
+def condition_a1_plus_a2_negative(
+    theta: jax.Array,
+) -> jax.Array:
+    """
+    The paper requires a_1 + a_2 < 0.
+
+    It is written in log-barrier form as
+
+        h_3(theta) = -(a_1 + a_2) > 0.
+    """
+    a_1, a_2 = theta[:2]
+    return -(a_1 + a_2)
+
+
+def condition_kp_positive(theta: jax.Array) -> jax.Array:
+    """Condition h_4(theta) = k_p > 0."""
+    k_p = theta[3]
+    return k_p
+
+
+def condition_kv_positive(theta: jax.Array) -> jax.Array:
+    """Condition h_5(theta) = k_v > 0."""
+    k_v = theta[4]
+    return k_v
+
+
+condition_functions: list[ConditionFunction] = [
+    condition_a1_positive,
+    condition_md_determinant,
+    condition_a1_plus_a2_negative,
+    condition_kp_positive,
+    condition_kv_positive,
+]
+
+# ---------------------------------------------------------
+# Explicit gradients of the condition functions
+# ---------------------------------------------------------
+
+def gradient_a1_positive(theta: jax.Array) -> jax.Array:
+    """Gradient of h_1(theta) = a_1."""
+    return jnp.array(
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        dtype=theta.dtype,
+    )
+
+
+def gradient_md_determinant(theta: jax.Array) -> jax.Array:
+    """
+    Gradient of
+
+        h_2(theta) = a_1 a_3 - a_2^2.
+    """
+    a_1, a_2, a_3 = theta[:3]
+
+    return jnp.array(
+        [
+            a_3,
+            -2.0 * a_2,
+            a_1,
+            0.0,
+            0.0,
+        ],
+        dtype=theta.dtype,
+    )
+
+
+def gradient_a1_plus_a2_negative(
+    theta: jax.Array,
+) -> jax.Array:
+    """
+    Gradient of
+
+        h_3(theta) = -(a_1 + a_2).
+    """
+    return jnp.array(
+        [-1.0, -1.0, 0.0, 0.0, 0.0],
+        dtype=theta.dtype,
+    )
+
+
+def gradient_kp_positive(theta: jax.Array) -> jax.Array:
+    """Gradient of h_4(theta) = k_p."""
+    return jnp.array(
+        [0.0, 0.0, 0.0, 1.0, 0.0],
+        dtype=theta.dtype,
+    )
+
+
+def gradient_kv_positive(theta: jax.Array) -> jax.Array:
+    """Gradient of h_5(theta) = k_v."""
+    return jnp.array(
+        [0.0, 0.0, 0.0, 0.0, 1.0],
+        dtype=theta.dtype,
+    )
+
+
+condition_gradient_functions: list[ConditionGradientFunction] = [
+    gradient_a1_positive,
+    gradient_md_determinant,
+    gradient_a1_plus_a2_negative,
+    gradient_kp_positive,
+    gradient_kv_positive,
+]
 
 def controller_constants(theta: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute gamma_1, gamma_2, and k_2 from [a_1,a_2,a_3,k_p,k_v]."""
@@ -385,14 +516,154 @@ def monte_carlo_deer_gradient(
 
 
 # =============================================================================
-# Plain gradient-descent update
+# Log Barrier gradient-descent update
 # =============================================================================
-def gradient_descent_update(
+def log_barrier_gradient_update(
     theta: jax.Array,
     mean_gradient: jax.Array,
+    condition_functions: Sequence[ConditionFunction],
+    condition_gradient_functions: Sequence[ConditionGradientFunction],
+    *,
+    learning_rate: float = LEARNING_RATE,
+    barrier_coefficient: float = BARRIER_COEFFICIENT,
+    feasibility_margin: float = FEASIBILITY_MARGIN,
+    backtracking_factor: float = BACKTRACKING_FACTOR,
+    max_backtracking_steps: int = MAX_BACKTRACKING_STEPS,
 ) -> jax.Array:
-    """Ordinary batch gradient descent: theta <- theta - alpha grad J."""
-    return theta - LEARNING_RATE * mean_gradient
+    """
+    Perform one first-order log-barrier gradient update.
+
+    The constrained problem is assumed to have the form
+
+        minimize    J(theta)
+        subject to  h_i(theta) > 0
+
+    The barrier objective is
+
+        J_barrier(theta)
+            = J(theta) - mu * sum_i log(h_i(theta)).
+
+    Parameters
+    ----------
+    theta:
+        Current policy parameter.
+
+    mean_gradient:
+        Gradient of the original objective J with respect to theta.
+
+    condition_functions:
+        List of scalar functions h_i(theta). A parameter is feasible when
+        every h_i(theta) is strictly positive.
+
+    condition_gradient_functions:
+        Optional list containing grad h_i(theta). When omitted, JAX
+        automatically differentiates each condition function.
+
+    learning_rate:
+        Initial gradient-descent step size.
+
+    barrier_coefficient:
+        The log-barrier coefficient mu.
+
+    feasibility_margin:
+        Require h_i(theta) > feasibility_margin instead of merely h_i > 0.
+
+    backtracking_factor:
+        Step-size reduction factor when a trial update is infeasible.
+
+    max_backtracking_steps:
+        Maximum number of feasibility backtracking steps.
+
+    Returns
+    -------
+    jax.Array
+        The updated, strictly feasible parameter theta.
+    """
+    if learning_rate <= 0.0:
+        raise ValueError("learning_rate must be positive.")
+
+    if barrier_coefficient <= 0.0:
+        raise ValueError("barrier_coefficient must be positive.")
+
+    if not 0.0 < backtracking_factor < 1.0:
+        raise ValueError("backtracking_factor must be between 0 and 1.")
+
+    if condition_gradient_functions is not None:
+        if len(condition_functions) != len(
+            condition_gradient_functions
+        ):
+            raise ValueError(
+                "condition_functions and condition_gradient_functions "
+                "must have the same length."
+            )
+
+    # Compute
+    #
+    #   grad J_barrier
+    #       = grad J - mu * sum_i grad h_i / h_i.
+    #
+    barrier_gradient = jnp.zeros_like(theta)
+
+    for i, condition_function in enumerate(condition_functions):
+        condition_value = jnp.asarray(
+            condition_function(theta)
+        )
+
+        if condition_value.ndim != 0:
+            raise ValueError(
+                f"Condition {i} must return a scalar, but returned "
+                f"an array with shape {condition_value.shape}."
+            )
+
+        if float(condition_value) <= feasibility_margin:
+            raise ValueError(
+                "The current theta must be strictly feasible. "
+                f"Condition {i} has value "
+                f"{float(condition_value):.6e}."
+            )
+
+        if condition_gradient_functions is None:
+            condition_gradient = jax.grad(
+                condition_function
+            )(theta)
+        else:
+            condition_gradient = (
+                condition_gradient_functions[i](theta)
+            )
+
+        barrier_gradient -= (
+            barrier_coefficient
+            * condition_gradient
+            / condition_value
+        )
+
+    total_gradient = mean_gradient + barrier_gradient
+
+    # Backtrack until the updated theta remains strictly feasible.
+    step_size = learning_rate
+
+    for _ in range(max_backtracking_steps + 1):
+        theta_candidate = theta - step_size * total_gradient
+
+        candidate_is_feasible = all(
+            float(
+                jnp.asarray(
+                    condition_function(theta_candidate)
+                )
+            )
+            > feasibility_margin
+            for condition_function in condition_functions
+        )
+
+        if candidate_is_feasible:
+            return theta_candidate
+
+        step_size *= backtracking_factor
+
+    raise RuntimeError(
+        "No feasible update was found. Reduce learning_rate, increase "
+        "max_backtracking_steps, or check the condition functions."
+    )
 
 
 # =============================================================================
@@ -588,7 +859,7 @@ def main() -> None:
         gradient_norm = jnp.linalg.norm(mean_gradient)
 
         # Plain gradient descent. No Adam, momentum, or adaptive scaling.
-        theta = gradient_descent_update(theta, mean_gradient)
+        theta = log_barrier_gradient_update(theta, mean_gradient, condition_functions, condition_gradient_functions)
 
         cost_history.append(float(mean_cost))
         gradient_norm_history.append(float(gradient_norm))
