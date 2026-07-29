@@ -33,7 +33,6 @@ Required files/packages:
 
 from __future__ import annotations
 from collections.abc import Callable, Sequence
-from typing import Optional
 
 import time
 from pathlib import Path
@@ -68,10 +67,10 @@ DEER_TOL = 1.0e-8
 # The gradient formula is a sum over the full horizon, so begin with a small
 # learning rate. This is ordinary gradient descent, not Adam.
 LEARNING_RATE = 1.0e-5
-BARRIER_COEFFICIENT = 1.0e-2
+BARRIER_COEFFICIENT = 1.0e-1
 FEASIBILITY_MARGIN = 1.0e-8
 BACKTRACKING_FACTOR = 0.5
-MAX_BACKTRACKING_STEPS = 20
+MAX_BACKTRACKING_STEPS = 200
 
 PRINT_EVERY = 5
 RESULTS_DIR = Path("inertia_wheel_log_barrier_two_pass_deer_mc_results")
@@ -824,9 +823,7 @@ def save_gif(
 def main() -> None:
     master_key = jr.PRNGKey(SEED)
     key_samples, key_training, key_final = jr.split(master_key, 3)
-
-    # Fixed Monte Carlo batch, matching the structure of the supplied example.
-    x_0_samples = sample_initial_states(key_samples, NUM_MC_SAMPLES)
+    
     theta = theta_initial
 
     cost_history = []
@@ -843,8 +840,9 @@ def main() -> None:
     start = time.perf_counter()
 
     for iteration in range(NUM_POLICY_ITERS):
+        sample_key = jr.fold_in(key_samples, iteration)
+        x_0_samples = sample_initial_states(sample_key, NUM_MC_SAMPLES)
         iteration_key = jr.fold_in(key_training, iteration)
-
         (
             mean_gradient,
             mean_cost,

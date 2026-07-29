@@ -554,8 +554,6 @@ def main() -> None:
     master_key = jr.PRNGKey(SEED)
     key_samples, key_training, key_final = jr.split(master_key, 3)
 
-    # Fixed Monte Carlo batch, matching the structure of the supplied example.
-    x_0_samples = sample_initial_states(key_samples, NUM_MC_SAMPLES)
     theta = theta_initial
 
     cost_history = []
@@ -572,8 +570,9 @@ def main() -> None:
     start = time.perf_counter()
 
     for iteration in range(NUM_POLICY_ITERS):
+        sample_key = jr.fold_in(key_samples, iteration)
+        x_0_samples = sample_initial_states(sample_key, NUM_MC_SAMPLES)
         iteration_key = jr.fold_in(key_training, iteration)
-
         (
             mean_gradient,
             mean_cost,
@@ -654,7 +653,6 @@ def main() -> None:
     np.savez(
         RESULTS_DIR / "training_results.npz",
         theta=theta_np,
-        x_0_samples=np.asarray(x_0_samples),
         cost_history=cost_history_np,
         gradient_norm_history=gradient_norm_history_np,
         parameter_history=parameter_history_np,
