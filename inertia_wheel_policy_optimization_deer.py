@@ -58,14 +58,14 @@ SEED = 0
 DT = 0.01
 T_HORIZON = 1000
 NUM_MC_SAMPLES = 128
-NUM_POLICY_ITERS = 80000
+NUM_POLICY_ITERS = 1
 
 DEER_MAX_ITERS = 5000
 DEER_TOL = 1.0e-8
 
 # The gradient formula is a sum over the full horizon, so begin with a small
 # learning rate. This is ordinary gradient descent, not Adam.
-LEARNING_RATE = 1.0e-5
+LEARNING_RATE = 0#1.0e-5
 
 PRINT_EVERY = 5
 RESULTS_DIR = Path("inertia_wheel_two_pass_deer_mc_results")
