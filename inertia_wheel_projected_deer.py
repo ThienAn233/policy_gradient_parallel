@@ -73,7 +73,7 @@ DEER_TOL = 1.0e-8
 
 # The gradient formula is a sum over the full horizon, so begin with a small
 # learning rate. This is projected gradient descent, not Adam.
-LEARNING_RATE = 1.0e-5
+LEARNING_RATE = 1.0e-4
 # Global L2-norm clipping is applied before the projected-gradient update.
 # With this value, the unconstrained parameter-step norm is at most 1.0e-3.
 MAX_GRAD_NORM = 100.0
