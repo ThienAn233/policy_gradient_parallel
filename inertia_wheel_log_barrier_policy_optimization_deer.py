@@ -63,6 +63,7 @@ NUM_POLICY_ITERS = 80000
 
 DEER_MAX_ITERS = 5000
 DEER_TOL = 1.0e-8
+QUASI = True
 
 # The gradient formula is a sum over the full horizon, so begin with a small
 # learning rate. This is ordinary gradient descent, not Adam.
@@ -73,7 +74,7 @@ BACKTRACKING_FACTOR = 0.5
 MAX_BACKTRACKING_STEPS = 200
 
 PRINT_EVERY = 5
-RESULTS_DIR = Path("inertia_wheel_log_barrier_two_pass_deer_mc_results")
+RESULTS_DIR = Path("inertia_wheel_log_barrier_quasi_two_pass_deer_mc_results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_DIM = 4
@@ -362,6 +363,7 @@ def forward_deer_single(
         dummy_inputs,
         num_iters=DEER_MAX_ITERS,
         full_trace=False,
+        quasi=QUASI,
         Ts=None,
         tol=DEER_TOL,
     )
@@ -409,6 +411,7 @@ def backward_deer_single(
         x_traj_reversed,
         num_iters=DEER_MAX_ITERS,
         full_trace=False,
+        quasi=QUASI,
         Ts=None,
         tol=DEER_TOL,
     )
