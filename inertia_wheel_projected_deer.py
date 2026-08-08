@@ -20,10 +20,11 @@ For each Monte Carlo initial state, the code evaluates
     grad_theta J = sum_k (grad_theta pi(x_k, theta)).T
                    @ (2 R pi(x_k, theta) + g.T @ lambda_{k+1}).
 
-The gradients are averaged across initial-state samples. Each unconstrained
-batch-gradient step is then projected onto the feasible policy-parameter set:
+The gradients are averaged across initial-state samples, clipped by their
+global L2 norm, and then projected onto the feasible policy-parameter set:
 
-    theta_trial <- theta - learning_rate * mean_gradient
+    clipped_gradient <- clip_by_global_norm(mean_gradient)
+    theta_trial <- theta - learning_rate * clipped_gradient
     theta       <- argmin_z 0.5 * ||z - theta_trial||_2^2
                    subject to h_i(z) >= feasibility_margin.
 
@@ -73,6 +74,9 @@ DEER_TOL = 1.0e-8
 # The gradient formula is a sum over the full horizon, so begin with a small
 # learning rate. This is projected gradient descent, not Adam.
 LEARNING_RATE = 1.0e-5
+# Global L2-norm clipping is applied before the projected-gradient update.
+# With this value, the unconstrained parameter-step norm is at most 1.0e-3.
+MAX_GRAD_NORM = 100.0
 FEASIBILITY_MARGIN = 1.0e-8
 PROJECTION_FTOL = 1.0e-12
 PROJECTION_MAX_ITERS = 200
@@ -520,6 +524,25 @@ def monte_carlo_deer_gradient(
 
 
 # =============================================================================
+# Gradient clipping
+# =============================================================================
+def clip_gradient_by_global_norm(
+    gradient: jax.Array,
+    max_norm: float = MAX_GRAD_NORM,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Clip a vector gradient to an L2 norm no larger than max_norm."""
+    if max_norm <= 0.0:
+        raise ValueError("max_norm must be positive.")
+
+    raw_norm = jnp.linalg.norm(gradient)
+    safe_norm = jnp.maximum(raw_norm, jnp.finfo(gradient.dtype).tiny)
+    scale = jnp.minimum(1.0, max_norm / safe_norm)
+    clipped_gradient = scale * gradient
+    clipped_norm = jnp.linalg.norm(clipped_gradient)
+    return clipped_gradient, raw_norm, clipped_norm
+
+
+# =============================================================================
 # Euclidean projected-gradient update
 # =============================================================================
 def projected_gradient_update(
@@ -754,6 +777,8 @@ def sequential_rollout(
 
 def save_training_plots(
     cost_history: np.ndarray,
+    gradient_norm_history: np.ndarray,
+    clipped_gradient_norm_history: np.ndarray,
     parameter_history: np.ndarray,
     states: np.ndarray,
     costates: np.ndarray,
@@ -766,6 +791,27 @@ def save_training_plots(
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(RESULTS_DIR / "mean_cost.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(7, 4))
+    plt.semilogy(gradient_norm_history, label="raw gradient norm")
+    plt.semilogy(
+        clipped_gradient_norm_history,
+        label="clipped gradient norm",
+    )
+    plt.axhline(
+        MAX_GRAD_NORM,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label="clipping threshold",
+    )
+    plt.xlabel("policy-gradient iteration")
+    plt.ylabel("gradient L2 norm")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "gradient_norm_history.png", dpi=180)
     plt.close()
 
     labels = [r"$a_1$", r"$a_2$", r"$a_3$", r"$k_p$", r"$k_v$"]
@@ -895,11 +941,13 @@ def main() -> None:
 
     cost_history = []
     gradient_norm_history = []
+    clipped_gradient_norm_history = []
     parameter_history = []
 
     print("Inertia-wheel pendulum: two-pass DEER + Monte Carlo PGD")
     print(f"T_HORIZON={T_HORIZON}, NUM_MC_SAMPLES={NUM_MC_SAMPLES}")
     print(f"DEER_MAX_ITERS={DEER_MAX_ITERS}, LEARNING_RATE={LEARNING_RATE}")
+    print(f"MAX_GRAD_NORM={MAX_GRAD_NORM}")
     print("Initial theta [a_1, a_2, a_3, k_p, k_v]:")
     print(np.asarray(theta))
     print()
@@ -920,27 +968,32 @@ def main() -> None:
             iteration_key,
         )
 
-        gradient_norm = jnp.linalg.norm(mean_gradient)
+        (
+            clipped_gradient,
+            gradient_norm,
+            clipped_gradient_norm,
+        ) = clip_gradient_by_global_norm(mean_gradient)
 
-        # Project the unconstrained policy-gradient step onto the complete
-        # feasible parameter set. No barrier, Adam, momentum, or adaptive
-        # scaling is used.
+        # Use the clipped gradient for the unconstrained step, then project
+        # that step onto the complete feasible parameter set.
         theta = projected_gradient_update(
             theta,
-            mean_gradient,
+            clipped_gradient,
             condition_functions,
             condition_gradient_functions,
         )
 
         cost_history.append(float(mean_cost))
         gradient_norm_history.append(float(gradient_norm))
+        clipped_gradient_norm_history.append(float(clipped_gradient_norm))
         parameter_history.append(np.asarray(theta))
 
         if iteration % PRINT_EVERY == 0 or iteration == NUM_POLICY_ITERS - 1:
             print(
                 f"iter={iteration:03d} | "
                 f"mean_cost={float(mean_cost):12.6f} | "
-                f"grad_norm={float(gradient_norm):10.4e} | "
+                f"raw_grad_norm={float(gradient_norm):10.4e} | "
+                f"clipped_grad_norm={float(clipped_gradient_norm):10.4e} | "
                 f"fwd_steps={float(mean_forward_steps):6.1f} | "
                 f"bwd_steps={float(mean_backward_steps):6.1f}"
             )
@@ -975,10 +1028,15 @@ def main() -> None:
 
     cost_history_np = np.asarray(cost_history)
     gradient_norm_history_np = np.asarray(gradient_norm_history)
+    clipped_gradient_norm_history_np = np.asarray(
+        clipped_gradient_norm_history
+    )
     parameter_history_np = np.asarray(parameter_history)
 
     save_training_plots(
         cost_history_np,
+        gradient_norm_history_np,
+        clipped_gradient_norm_history_np,
         parameter_history_np,
         final_states_np,
         final_costates_np,
@@ -999,6 +1057,7 @@ def main() -> None:
         x_0_samples=np.asarray(x_0_samples),
         cost_history=cost_history_np,
         gradient_norm_history=gradient_norm_history_np,
+        clipped_gradient_norm_history=clipped_gradient_norm_history_np,
         parameter_history=parameter_history_np,
         final_states=final_states_np,
         final_costates=final_costates_np,
